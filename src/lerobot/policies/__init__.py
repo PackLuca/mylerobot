@@ -24,6 +24,8 @@ from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
+# Flow Matching 相关配置
+from .flow.configuration_flow import FlowConfig as FlowConfig
 
 __all__ = [
     "ACTConfig",
@@ -38,4 +40,6 @@ __all__ = [
     "GrootConfig",
     "XVLAConfig",
     "WallXConfig",
+    # Flow Matching 相关配置
+    "FlowConfig",
 ]

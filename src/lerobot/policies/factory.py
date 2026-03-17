@@ -30,6 +30,9 @@ from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+#增加Flow Matching的配置
+from lerobot.policies.flow.configuration_flow import FlowConfig
+
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -301,6 +304,14 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    #直接复用Diffusion的预处理和后处理逻辑
+    elif isinstance(policy_cfg, FlowConfig):
+        from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+        processors = make_diffusion_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+        
     elif isinstance(policy_cfg, ACTConfig):
         from lerobot.policies.act.processor_act import make_act_pre_post_processors
 
