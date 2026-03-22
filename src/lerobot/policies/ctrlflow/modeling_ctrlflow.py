@@ -283,11 +283,14 @@ class CtrlFlowModel(nn.Module):
         # When global_cond_dim == 0 (no image, no env_state), only the first
         # two terms contribute — handled defensively in _build_ratio_input().
         action_flat_dim = config.horizon * config.action_feature.shape[0]
-        # global_cond_dim may be 0 if validate_features would have caught it,
-        # but we build the dim correctly regardless.
+        # Timestep feature dimension = 1 (normalized scalar t/T, detached).
+        # We do NOT use diffusion_step_embed_dim here because the UNet's
+        # diffusion_step_encoder MLP can silently block gradients to ratio_net
+        # in mixed-precision / DDP settings, freezing grdn at a constant.
+        t_feat_dim = 1
         ratio_input_dim = (
             action_flat_dim
-            + config.diffusion_step_embed_dim
+            + t_feat_dim
             + global_cond_dim * config.n_obs_steps
         )
         hidden = config.chi2_ratio_net_hidden_dim
@@ -300,6 +303,7 @@ class CtrlFlowModel(nn.Module):
             # No activation: outputs log_r in R.
             # r = exp(clamp(log_r, -L, L)) computed in forward pass.
         )
+        # log-space clamp bound: r in [exp(-L), exp(L)]
         self._log_r_clamp = config.chi2_log_r_clamp
         # Training step counter for single-process fallback.
         # In DDP training, pass global_step from the trainer instead.
@@ -423,9 +427,12 @@ class CtrlFlowModel(nn.Module):
                 # everything in @torch.no_grad().
                 with torch.enable_grad():
                     x_in = sample.detach().requires_grad_(True)
-                    t_emb = self.unet.diffusion_step_encoder(t_tensor)  # (B, embed_dim)
+                    # Normalized scalar timestep feature, consistent with training.
+                    t_feat = torch.full(
+                        (batch_size, 1), t_cont, dtype=dtype, device=device
+                    )  # already in [0,1]
                     x_flat = x_in.flatten(start_dim=1)                  # (B, H*action_dim)
-                    ratio_input = self._build_ratio_input(x_flat, t_emb, global_cond)
+                    ratio_input = self._build_ratio_input(x_flat, t_feat, global_cond)
                     log_r = self.ratio_net(ratio_input).squeeze(-1)
                     log_r = torch.clamp(log_r, min=-self._log_r_clamp, max=self._log_r_clamp)
                     r_hat = torch.exp(log_r)                            # (B,)
@@ -593,13 +600,21 @@ class CtrlFlowModel(nn.Module):
         # ── Phase 2: Pearson chi2 density-ratio loss ──────────────────────
         self._freeze_unet()
 
-        # ── Timestep embedding ─────────────────────────────────────────────
-        t_emb = self.unet.diffusion_step_encoder(timesteps)   # (B, embed_dim)
+        # ── Timestep feature: detached normalized scalar ───────────────────
+        # We use a simple normalized timestep t/T instead of the UNet's
+        # diffusion_step_encoder MLP. This avoids a subtle gradient-blocking
+        # issue: t_emb computed via diffusion_step_encoder is part of the UNet
+        # subgraph. Even though diffusion_step_encoder is not frozen, the
+        # gradient path from ratio_net through t_emb back to ratio_net.parameters
+        # can be silently broken by the accelerator's mixed-precision or DDP
+        # wrappers, causing grdn to freeze at a constant (observed: 0.307).
+        # A detached scalar feature removes this dependency entirely.
+        # Shape: (B, 1), value in [0, 1].
+        t_feat = (timesteps.float() / self.config.num_train_timesteps).unsqueeze(-1).detach()
 
         # ── Contrastive batch: separate leaf tensors, then cat ────────────
         # IMPORTANT: never do x_all = cat(...); x_all[:B].requires_grad_(True)
         # That moves a leaf into the graph interior -> RuntimeError.
-        # Instead, create x_clean_flat as a standalone leaf BEFORE cat.
         need_grad = self.config.chi2_lyapunov_lambda > 0
 
         x_noisy_flat = noisy_trajectory.detach().flatten(start_dim=1)  # (B, H*D)
@@ -609,20 +624,19 @@ class CtrlFlowModel(nn.Module):
             x_clean_flat = trajectory.detach().flatten(start_dim=1)
 
         # Stack: first B = p_data (clean), last B = p_t (noisy)
-        x_all    = torch.cat([x_clean_flat, x_noisy_flat], dim=0)  # (2B, H*D)
-        t_all    = torch.cat([t_emb, t_emb], dim=0)                # (2B, embed)
+        x_all   = torch.cat([x_clean_flat, x_noisy_flat], dim=0)   # (2B, H*D)
+        t_all   = torch.cat([t_feat, t_feat], dim=0)               # (2B, 1)
         cond_all = (
             torch.cat([global_cond, global_cond], dim=0)
             if global_cond is not None else None
         )
 
         # ── Single forward pass over contrastive 2B batch ─────────────────
-        log_r_all = self.ratio_net(
-            self._build_ratio_input(x_all, t_all, cond_all)
-        ).squeeze(-1)                                               # (2B,)
+        ratio_input_all = self._build_ratio_input(x_all, t_all, cond_all)
+        log_r_all = self.ratio_net(ratio_input_all).squeeze(-1)     # (2B,)
 
         # log-space clamp: r = exp(clamp(log_r, -L, L))
-        # Bounds r in [exp(-L), exp(L)] without zeroing gradients.
+        # Bounds r without zeroing gradients at the boundary.
         log_r_all = torch.clamp(
             log_r_all, min=-self._log_r_clamp, max=self._log_r_clamp
         )
@@ -640,7 +654,6 @@ class CtrlFlowModel(nn.Module):
         chi2_loss = loss_pt + loss_data + 1.0
 
         # ── Lyapunov regulariser (optional) ───────────────────────────────
-        # x_clean_flat is a proper leaf tensor, autograd.grad works correctly.
         lyapunov_reg = torch.zeros(1, device=trajectory.device)
         if need_grad:
             grad_r = torch.autograd.grad(
