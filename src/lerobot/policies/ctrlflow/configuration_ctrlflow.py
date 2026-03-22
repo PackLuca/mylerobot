@@ -179,7 +179,12 @@ class CtrlFlowConfig(PreTrainedConfig):
     # Number of Euler ODE steps used in Phase 2 inference.
     # Separate from num_inference_steps which controls DDPM/DDIM in Phase 1.
     chi2_num_inference_steps: int = 20
-    chi2_ratio_net_clamp: float = 10.0  # ← 新增，密度比上界
+    # log-space clamp for the density-ratio network output.
+    # ratio_net outputs log_r ∈ ℝ; we clamp to [-chi2_log_r_clamp, +chi2_log_r_clamp]
+    # before exp(), bounding r = exp(log_r) ∈ [exp(-5), exp(5)] ≈ [0.007, 148].
+    # This replaces the old chi2_ratio_net_clamp which clamped r directly and
+    # truncated gradients at the clamp boundary.
+    chi2_log_r_clamp: float = 5.0
 
     def __post_init__(self):
         super().__post_init__()

@@ -52,6 +52,11 @@ Fix log (vs. original):
           to 0.1, making it tunable for different action-space dimensionalities.
   [BUG-6] UNet parameters are frozen during Phase 2 training (only ratio_net and
           the shared timestep encoder are trained), saving memory and compute.
+  [BUG-7] ratio_net now outputs log_r ∈ ℝ (no Softplus) instead of r directly.
+          The loss and inference use r = exp(clamp(log_r, -L, +L)), keeping r
+          bounded without truncating gradients at the clamp boundary.
+          This fixes the χ² loss exploding to -∞ caused by the unconstrained
+          -E[r²] term driving r → ∞ during early Phase 2 training.
 """
 
 import math
@@ -297,11 +302,12 @@ class CtrlFlowModel(nn.Module):
             nn.Linear(hidden, hidden),
             nn.SiLU(),
             nn.Linear(hidden, 1),
-            nn.Softplus(),  # guarantees r_hat > 0 (density ratio is non-negative)
+            # No activation: network outputs log_r ∈ ℝ.
+            # r = exp(clamp(log_r, -L, L)) is computed explicitly in forward,
+            # keeping r bounded without truncating gradients at the boundary.
         )
-        # 密度比的合理上界。r_hat > r_max 时梯度为 0，防止 -E[r²] 项无界下降。
-        # 对于归一化动作空间，r_max=10 是保守但安全的选择。
-        self.ratio_net_clamp = config.chi2_ratio_net_clamp
+        # log-space clamp bound L: r ∈ [exp(-L), exp(L)]
+        self._log_r_clamp = config.chi2_log_r_clamp
         # Training step counter for single-process fallback.
         # In DDP training, pass global_step from the trainer instead.
         self.register_buffer("_ctrl_flow_step", torch.zeros(1, dtype=torch.long))
@@ -427,7 +433,11 @@ class CtrlFlowModel(nn.Module):
                     t_emb = self.unet.diffusion_step_encoder(t_tensor)  # (B, embed_dim)
                     x_flat = x_in.flatten(start_dim=1)                  # (B, H*action_dim)
                     ratio_input = self._build_ratio_input(x_flat, t_emb, global_cond)
-                    r_hat = self.ratio_net(ratio_input).squeeze(-1).clamp(max=self.ratio_net_clamp)   # (B,)
+
+                    # ratio_net outputs log_r; clamp then exp to get bounded r.
+                    log_r = self.ratio_net(ratio_input).squeeze(-1)     # (B,)
+                    log_r = torch.clamp(log_r, min=-self._log_r_clamp, max=self._log_r_clamp)
+                    r_hat = torch.exp(log_r)                            # (B,) r ∈ (0, exp(L)]
 
                     # ∇_x r_hat: shape (B, H*action_dim)
                     grad_r_flat = torch.autograd.grad(r_hat.sum(), x_in)[0].flatten(start_dim=1)
@@ -600,7 +610,12 @@ class CtrlFlowModel(nn.Module):
         # ── Density ratio on noisy (p_t) samples ──────────────────────────
         x_noisy_flat = noisy_trajectory.flatten(start_dim=1)  # (B, H*action_dim)
         ratio_input_pt = self._build_ratio_input(x_noisy_flat, t_emb, global_cond)
-        r_hat_pt = self.ratio_net(ratio_input_pt).squeeze(-1).clamp(max=self.ratio_net_clamp)  # (B,)
+        # ratio_net outputs log_r; clamp in log-space then exp.
+        # Gradient flows through exp(clamp(log_r)) even at the boundary,
+        # unlike direct clamp on r which zeros the gradient.
+        log_r_pt = self.ratio_net(ratio_input_pt).squeeze(-1)                       # (B,)
+        log_r_pt = torch.clamp(log_r_pt, min=-self._log_r_clamp, max=self._log_r_clamp)
+        r_hat_pt = torch.exp(log_r_pt)                                               # (B,)
 
         # ── Density ratio on clean (p_data) samples ───────────────────────
         # requires_grad only when we need ∇_x r_hat for the Lyapunov regulariser.
@@ -610,13 +625,16 @@ class CtrlFlowModel(nn.Module):
             x_clean = x_clean.detach().requires_grad_(True)
 
         ratio_input_pdata = self._build_ratio_input(x_clean, t_emb, global_cond)
-        r_hat_pdata = self.ratio_net(ratio_input_pdata).squeeze(-1)  # (B,)
+        log_r_pdata = self.ratio_net(ratio_input_pdata).squeeze(-1)                  # (B,)
+        log_r_pdata = torch.clamp(log_r_pdata, min=-self._log_r_clamp, max=self._log_r_clamp)
+        r_hat_pdata = torch.exp(log_r_pdata)                                         # (B,)
 
-        # ── Pearson χ² loss ────────────────────────────────────────────────
+        # ── Pearson χ² loss (log-space stable) ────────────────────────────
         # L = E_{p_t}[(r-1)²] - E_{p_data}[r²] + 1
-        # At optimum: r*(x) = p_t(x)/p_data(x) and L = -D_χ²(p_t ‖ p_data)
-        loss_pt   = ((r_hat_pt - 1.0) ** 2).mean()   # E_{p_t}[(r-1)²]
-        loss_data = -(r_hat_pdata ** 2).mean()         # -E_{p_data}[r²]
+        # r = exp(clamp(log_r, -L, L)) is bounded in [exp(-L), exp(L)],
+        # so -E[r²] cannot diverge to -∞ as it did with the unbounded Softplus.
+        loss_pt   = ((r_hat_pt - 1.0) ** 2).mean()    # E_{p_t}[(r-1)²]  ≥ 0
+        loss_data = -(r_hat_pdata ** 2).mean()          # -E_{p_data}[r²]  ≥ -exp(2L)
         chi2_loss = loss_pt + loss_data + 1.0
 
         # ── Lyapunov regulariser (optional) ───────────────────────────────
@@ -630,11 +648,14 @@ class CtrlFlowModel(nn.Module):
         # computation graph on every step, causing a training-time memory leak.
         lyapunov_reg = torch.zeros(1, device=trajectory.device)
         if need_grad:
+            # Gradient flows through r_hat_pdata = exp(clamp(log_r_pdata)).
+            # clamp in log-space does NOT zero the gradient (unlike clamp on r),
+            # so autograd.grad correctly computes ∇_x r_hat here.
             grad_r = torch.autograd.grad(
                 r_hat_pdata.sum(),
                 x_clean,
                 create_graph=False,   # first-order only; avoids memory leak
-                retain_graph=True,   #报错，需要修改为True
+                retain_graph=True,    # keep graph for total_loss.backward()
             )[0]  # (B, H*action_dim)
 
             # Φ ≈ E_{p_data}[‖∇_x r‖²]  (batch estimate)
