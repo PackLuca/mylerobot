@@ -297,11 +297,9 @@ class CtrlFlowModel(nn.Module):
             nn.Linear(hidden, hidden),
             nn.SiLU(),
             nn.Linear(hidden, 1),
-            # No activation: outputs log_r ∈ ℝ.
-            # r = exp(clamp(log_r, -L, L)) is computed in forward pass,
-            # bounding r without zeroing gradients at the clamp boundary.
+            # No activation: outputs log_r in R.
+            # r = exp(clamp(log_r, -L, L)) computed in forward pass.
         )
-        # log-space clamp bound L: r ∈ [exp(-L), exp(L)]
         self._log_r_clamp = config.chi2_log_r_clamp
         # Training step counter for single-process fallback.
         # In DDP training, pass global_step from the trainer instead.
@@ -428,13 +426,11 @@ class CtrlFlowModel(nn.Module):
                     t_emb = self.unet.diffusion_step_encoder(t_tensor)  # (B, embed_dim)
                     x_flat = x_in.flatten(start_dim=1)                  # (B, H*action_dim)
                     ratio_input = self._build_ratio_input(x_flat, t_emb, global_cond)
-
-                    # log-space: consistent with training
                     log_r = self.ratio_net(ratio_input).squeeze(-1)
                     log_r = torch.clamp(log_r, min=-self._log_r_clamp, max=self._log_r_clamp)
                     r_hat = torch.exp(log_r)                            # (B,)
 
-                    # ∇_x r_hat: shape (B, H*action_dim)
+                    # grad_x r_hat
                     grad_r_flat = torch.autograd.grad(r_hat.sum(), x_in)[0].flatten(start_dim=1)
 
                 # Reshape and compute drift; clip for numerical stability.
@@ -594,82 +590,66 @@ class CtrlFlowModel(nn.Module):
                 loss = loss * in_episode_bound.unsqueeze(-1)
             return loss.mean()
 
-        # ── Phase 2: Pearson χ² density-ratio loss ─────────────────────────
-        # Freeze UNet backbone (keep timestep encoder trainable so ratio_net
-        # benefits from its gradients).
+        # ── Phase 2: Pearson chi2 density-ratio loss ──────────────────────
         self._freeze_unet()
 
         # ── Timestep embedding ─────────────────────────────────────────────
         t_emb = self.unet.diffusion_step_encoder(timesteps)   # (B, embed_dim)
 
-        # ── Contrastive batch construction ────────────────────────────────
-        # ratio_net must simultaneously see both p_t and p_data samples to
-        # produce a meaningful density-ratio estimate. Feeding them separately
-        # in two forward passes gives a weak contrast signal and causes
-        # ratio_net to degenerate to a constant (grdn → 0, loss frozen).
-        #
-        # Fix: concatenate p_data (clean) and p_t (noisy) into a single batch
-        # of size 2B, run one forward pass, then split the outputs.
-        # This ensures the gradient of the loss w.r.t. ratio_net parameters
-        # reflects the difference between the two distributions.
-        B = trajectory.shape[0]
-        x_clean_flat = trajectory.flatten(start_dim=1)          # (B, H*action_dim)
-        x_noisy_flat = noisy_trajectory.flatten(start_dim=1)    # (B, H*action_dim)
+        # ── Contrastive batch: separate leaf tensors, then cat ────────────
+        # IMPORTANT: never do x_all = cat(...); x_all[:B].requires_grad_(True)
+        # That moves a leaf into the graph interior -> RuntimeError.
+        # Instead, create x_clean_flat as a standalone leaf BEFORE cat.
+        need_grad = self.config.chi2_lyapunov_lambda > 0
 
-        # Stack: first B rows = p_data, last B rows = p_t
-        x_all   = torch.cat([x_clean_flat, x_noisy_flat], dim=0)   # (2B, H*action_dim)
-        t_all   = torch.cat([t_emb,        t_emb],        dim=0)   # (2B, embed_dim)
+        x_noisy_flat = noisy_trajectory.detach().flatten(start_dim=1)  # (B, H*D)
+        if need_grad:
+            x_clean_flat = trajectory.detach().flatten(start_dim=1).requires_grad_(True)
+        else:
+            x_clean_flat = trajectory.detach().flatten(start_dim=1)
+
+        # Stack: first B = p_data (clean), last B = p_t (noisy)
+        x_all    = torch.cat([x_clean_flat, x_noisy_flat], dim=0)  # (2B, H*D)
+        t_all    = torch.cat([t_emb, t_emb], dim=0)                # (2B, embed)
         cond_all = (
             torch.cat([global_cond, global_cond], dim=0)
             if global_cond is not None else None
-        )                                                            # (2B, cond_dim) or None
+        )
 
-        # Lyapunov regulariser needs ∇_x r on the p_data slice.
-        need_grad = self.config.chi2_lyapunov_lambda > 0
-        if need_grad:
-            # Only the p_data slice (first B rows) needs x-gradient.
-            # We split after the forward pass, so enable grad on x_all[:B].
-            x_all = x_all.detach()
-            x_all[:B] = x_all[:B].requires_grad_(True)
+        # ── Single forward pass over contrastive 2B batch ─────────────────
+        log_r_all = self.ratio_net(
+            self._build_ratio_input(x_all, t_all, cond_all)
+        ).squeeze(-1)                                               # (2B,)
 
-        # ── Single forward pass over the contrastive batch ────────────────
-        ratio_input_all = self._build_ratio_input(x_all, t_all, cond_all)
-        log_r_all = self.ratio_net(ratio_input_all).squeeze(-1)     # (2B,)
-
-        # Clamp in log-space: r = exp(clamp(log_r, -L, L)).
-        # This bounds r ∈ [exp(-L), exp(L)] without zeroing gradients at
-        # the boundary (unlike direct clamp on r after Softplus).
+        # log-space clamp: r = exp(clamp(log_r, -L, L))
+        # Bounds r in [exp(-L), exp(L)] without zeroing gradients.
         log_r_all = torch.clamp(
             log_r_all, min=-self._log_r_clamp, max=self._log_r_clamp
         )
         r_all = torch.exp(log_r_all)                                # (2B,)
 
-        r_hat_pdata = r_all[:B]    # (B,)  r on clean p_data samples
-        r_hat_pt    = r_all[B:]    # (B,)  r on noisy p_t samples
+        B = trajectory.shape[0]
+        r_hat_pdata = r_all[:B]   # (B,) density ratio on clean p_data
+        r_hat_pt    = r_all[B:]   # (B,) density ratio on noisy p_t
 
-        # ── Pearson χ² loss (log-space stable) ────────────────────────────
-        # L = E_{p_t}[(r-1)²] - E_{p_data}[r²] + 1
-        # Minimum value = -D_χ²(p_t ‖ p_data) ≤ 0, so negative loss is normal.
-        # With log-space clamp, loss is bounded below by -(exp(2L) + 1).
-        loss_pt   = ((r_hat_pt   - 1.0) ** 2).mean()   # E_{p_t}[(r-1)²]  ≥ 0
-        loss_data = -(r_hat_pdata ** 2).mean()           # -E_{p_data}[r²] ≥ -exp(2L)
+        # ── Pearson chi2 loss ──────────────────────────────────────────────
+        # L = E_{p_t}[(r-1)^2] - E_{p_data}[r^2] + 1
+        # Optimal = -D_chi2(p_t || p_data) <= 0, so negative loss is normal.
+        loss_pt   = ((r_hat_pt   - 1.0) ** 2).mean()
+        loss_data = -(r_hat_pdata ** 2).mean()
         chi2_loss = loss_pt + loss_data + 1.0
 
         # ── Lyapunov regulariser (optional) ───────────────────────────────
-        # Penalises Φ = E_{p_data}[‖∇_x r‖²] → 0, which signals ratio_net
-        # has degenerated to a constant (Identifiability condition, Theorem 1).
-        # Gradient flows through r_hat_pdata = exp(clamp(log_r)) correctly
-        # because log-space clamp does NOT zero the gradient at the boundary.
+        # x_clean_flat is a proper leaf tensor, autograd.grad works correctly.
         lyapunov_reg = torch.zeros(1, device=trajectory.device)
         if need_grad:
             grad_r = torch.autograd.grad(
                 r_hat_pdata.sum(),
-                x_all,                  # grad w.r.t. full x_all; only [:B] has grad
-                create_graph=False,     # first-order only; avoids memory leak
-                retain_graph=True,      # keep graph for total_loss.backward()
-            )[0][:B]                    # (B, H*action_dim) — p_data slice only
-
-            phi = (grad_r ** 2).sum(dim=-1).mean()   # Φ batch estimate
+                x_clean_flat,
+                create_graph=False,  # first-order only
+                retain_graph=True,   # keep graph for total_loss.backward()
+            )[0]                     # (B, H*D)
+            phi = (grad_r ** 2).sum(dim=-1).mean()
             lyapunov_reg = self.config.chi2_lyapunov_lambda * torch.relu(
                 self.config.chi2_phi_min - phi
             )
@@ -678,8 +658,8 @@ class CtrlFlowModel(nn.Module):
 
         # ── Padding mask ───────────────────────────────────────────────────
         if self.config.do_mask_loss_for_padding and "action_is_pad" in batch:
-            in_episode_bound = ~batch["action_is_pad"]           # (B, H) bool
-            valid_weight = in_episode_bound.float().mean(dim=-1) # (B,)
+            in_episode_bound = ~batch["action_is_pad"]
+            valid_weight = in_episode_bound.float().mean(dim=-1)
             total_loss = total_loss * valid_weight.mean()
 
         return total_loss
