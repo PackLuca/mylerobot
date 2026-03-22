@@ -32,6 +32,8 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 #增加Flow Matching的配置
 from lerobot.policies.flow.configuration_flow import FlowConfig
+#增加Ctrl-Flow的配置
+from lerobot.policies.ctrlflow.configuration_ctrlflow import CtrlFlowConfig
 
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -292,6 +294,14 @@ def make_pre_post_processors(
         from lerobot.policies.tdmpc.processor_tdmpc import make_tdmpc_pre_post_processors
 
         processors = make_tdmpc_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    #直接复用Diffusion的预处理和后处理逻辑
+    elif isinstance(policy_cfg, CtrlFlowConfig):
+        from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+        processors = make_diffusion_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
