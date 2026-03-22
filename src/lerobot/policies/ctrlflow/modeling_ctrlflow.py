@@ -626,7 +626,7 @@ class CtrlFlowModel(nn.Module):
                 r_hat_pdata.sum(),
                 x_clean,
                 create_graph=False,   # first-order only; avoids memory leak
-                retain_graph=False,
+                retain_graph=True,   #报错，需要修改为True
             )[0]  # (B, H*action_dim)
 
             # Φ ≈ E_{p_data}[‖∇_x r‖²]  (batch estimate)
