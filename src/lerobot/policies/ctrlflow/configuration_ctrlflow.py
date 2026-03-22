@@ -171,7 +171,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 500
 
     # ── χ²-CTRL-Flow specific parameters ──────────────────────────────────
-    chi2_warmup_steps: int = 100
+    chi2_warmup_steps: int = 400
     chi2_lyapunov_lambda: float = 0.01
     chi2_phi_min: float = 0.1
     chi2_diffusion_beta: float = 0.1
