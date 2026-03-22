@@ -179,6 +179,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     # Number of Euler ODE steps used in Phase 2 inference.
     # Separate from num_inference_steps which controls DDPM/DDIM in Phase 1.
     chi2_num_inference_steps: int = 20
+    chi2_ratio_net_clamp: float = 10.0  # ← 新增，密度比上界
 
     def __post_init__(self):
         super().__post_init__()

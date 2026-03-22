@@ -109,8 +109,14 @@ class CtrlFlowPolicy(PreTrainedPolicy):
         self.diffusion = CtrlFlowModel(config)
         self.reset()
 
-    def get_optim_params(self) -> dict:
-        return self.diffusion.parameters()
+    # get_optim_params 里分组
+    def get_optim_params(self):
+        return [
+            {"params": self.diffusion.unet.parameters(), 
+            "lr": self.config.optimizer_lr},
+            {"params": self.diffusion.ratio_net.parameters(), 
+            "lr": self.config.optimizer_lr * 0.1},  # ratio_net 小10倍
+        ]
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -293,7 +299,9 @@ class CtrlFlowModel(nn.Module):
             nn.Linear(hidden, 1),
             nn.Softplus(),  # guarantees r_hat > 0 (density ratio is non-negative)
         )
-
+        # 密度比的合理上界。r_hat > r_max 时梯度为 0，防止 -E[r²] 项无界下降。
+        # 对于归一化动作空间，r_max=10 是保守但安全的选择。
+        self.ratio_net_clamp = config.chi2_ratio_net_clamp
         # Training step counter for single-process fallback.
         # In DDP training, pass global_step from the trainer instead.
         self.register_buffer("_ctrl_flow_step", torch.zeros(1, dtype=torch.long))
@@ -419,7 +427,7 @@ class CtrlFlowModel(nn.Module):
                     t_emb = self.unet.diffusion_step_encoder(t_tensor)  # (B, embed_dim)
                     x_flat = x_in.flatten(start_dim=1)                  # (B, H*action_dim)
                     ratio_input = self._build_ratio_input(x_flat, t_emb, global_cond)
-                    r_hat = self.ratio_net(ratio_input).squeeze(-1)     # (B,)
+                    r_hat = self.ratio_net(ratio_input).squeeze(-1).clamp(max=self.ratio_net_clamp)   # (B,)
 
                     # ∇_x r_hat: shape (B, H*action_dim)
                     grad_r_flat = torch.autograd.grad(r_hat.sum(), x_in)[0].flatten(start_dim=1)
@@ -592,7 +600,7 @@ class CtrlFlowModel(nn.Module):
         # ── Density ratio on noisy (p_t) samples ──────────────────────────
         x_noisy_flat = noisy_trajectory.flatten(start_dim=1)  # (B, H*action_dim)
         ratio_input_pt = self._build_ratio_input(x_noisy_flat, t_emb, global_cond)
-        r_hat_pt = self.ratio_net(ratio_input_pt).squeeze(-1)  # (B,)
+        r_hat_pt = self.ratio_net(ratio_input_pt).squeeze(-1).clamp(max=self.ratio_net_clamp)  # (B,)
 
         # ── Density ratio on clean (p_data) samples ───────────────────────
         # requires_grad only when we need ∇_x r_hat for the Lyapunov regulariser.
