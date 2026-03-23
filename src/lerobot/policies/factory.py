@@ -34,6 +34,7 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.flow.configuration_flow import FlowConfig
 #增加Ctrl-Flow的配置
 from lerobot.policies.ctrlflow.configuration_ctrlflow import CtrlFlowConfig
+from lerobot.policies.ctrlflow1.configuration_ctrlflow1 import CTRLFlow1Config
 
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -305,6 +306,12 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
+    elif isinstance(policy_cfg, CTRLFlow1Config):
+        from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+        processors = make_diffusion_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )        
 
     elif isinstance(policy_cfg, DiffusionConfig):
         from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors

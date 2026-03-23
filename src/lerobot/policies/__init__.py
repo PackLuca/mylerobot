@@ -26,8 +26,11 @@ from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 # Flow Matching 相关配置
 from .flow.configuration_flow import FlowConfig as FlowConfig
-#Ctrl-Flow 相关配置
+#Ctrl-Flow(X^2) 相关配置
 from .ctrlflow.configuration_ctrlflow import CtrlFlowConfig as CtrlFlowConfig
+#Ctrl-Flow1(Wasserstein) 相关配置
+from .ctrlflow1.configuration_ctrlflow1 import CTRLFlow1Config as CTRLFlow1Config
+
 
 __all__ = [
     "ACTConfig",
@@ -46,4 +49,5 @@ __all__ = [
     "FlowConfig",
     # Flow Matching 相关配置
     "CtrlFlowConfig",
+    "CTRLFlow1Config",
 ]
