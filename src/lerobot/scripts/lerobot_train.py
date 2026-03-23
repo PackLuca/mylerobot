@@ -392,6 +392,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics["loss_phi"]         = AverageMeter("loss_phi",   ":.4f")
         train_metrics["wasserstein_weight"] = AverageMeter("w_coeff",  ":.4f")
 
+    # CTRLFlow2: Lyapunov stability tracking meters (no-op for other policies)
+    _is_ctrlflow2 = getattr(cfg.policy, "type", "") == "ctrlflow2"
+    if _is_ctrlflow2:
+        train_metrics["loss_diffusion"]      = AverageMeter("loss_diff",   ":.4f")
+        train_metrics["loss_lyapunov"]       = AverageMeter("loss_lyap",   ":.4f")
+        train_metrics["lyapunov_reg"]        = AverageMeter("lyap_reg",    ":.4f")
+        train_metrics["fisher_dissipation"]  = AverageMeter("fisher_phi",  ":.4f")
+        train_metrics["beta_scale"]          = AverageMeter("beta_scale",  ":.4f")
+
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * accelerator.num_processes
     train_tracker = MetricsTracker(
@@ -436,6 +445,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # CTRLFlow1: push per-step Wasserstein metrics into the tracker
         if _is_ctrlflow1 and output_dict:
             for key in ("loss_diffusion", "loss_wasserstein", "loss_phi", "wasserstein_weight"):
+                if key in output_dict:
+                    setattr(train_tracker, key, output_dict[key])
+
+        # CTRLFlow2: push per-step Lyapunov metrics into the tracker
+        if _is_ctrlflow2 and output_dict:
+            for key in ("loss_diffusion", "loss_lyapunov", "lyapunov_reg", "fisher_dissipation", "beta_scale"):
                 if key in output_dict:
                     setattr(train_tracker, key, output_dict[key])
 
