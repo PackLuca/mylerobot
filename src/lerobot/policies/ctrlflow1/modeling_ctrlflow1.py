@@ -427,9 +427,11 @@ class CTRLFlow1Model(nn.Module):
         loss_diffusion = loss_diffusion.mean()
 
         # ── Wasserstein regularization ────────────────────────────────────────
-        w_coeff = self._wasserstein_weight()
+        w_coeff      = self._wasserstein_weight()
         loss_w_val   = 0.0
         loss_phi_val = 0.0
+        cos_sim_val  = 0.0
+        conflict_scale = 1.0
 
         if w_coeff > 0.0:
             # Flatten trajectories for φ: (B, horizon*action_dim)
@@ -440,23 +442,53 @@ class CTRLFlow1Model(nn.Module):
             loss_phi_val = self._update_phi(x_model.detach(), x_data.detach())
 
             # Step 2: Wasserstein loss for UNet
-            #   x_model here retains grad w.r.t. UNet params through noisy_trajectory
             loss_w = self._wasserstein_unet_loss(x_model)
             loss_w_val = loss_w.item()
+
+            # Step 3: PCGrad — 检测梯度方向冲突，冲突时动态降权
+            # 用 UNet final_conv 作为代理参数，计算量极小
+            proxy_params = [p for p in self.unet.final_conv.parameters()
+                            if p.requires_grad]
+            if proxy_params:
+                grad_diff = torch.autograd.grad(
+                    loss_diffusion, proxy_params,
+                    retain_graph=True, allow_unused=True
+                )
+                grad_w = torch.autograd.grad(
+                    loss_w, proxy_params,
+                    retain_graph=True, allow_unused=True
+                )
+                # 过滤掉 None（allow_unused 可能产生）
+                g_diff_parts = [g.flatten() for g in grad_diff if g is not None]
+                g_w_parts    = [g.flatten() for g in grad_w    if g is not None]
+
+                if g_diff_parts and g_w_parts:
+                    g_diff_flat = torch.cat(g_diff_parts)
+                    g_w_flat    = torch.cat(g_w_parts)
+                    cos_sim_val = F.cosine_similarity(
+                        g_diff_flat.unsqueeze(0),
+                        g_w_flat.unsqueeze(0),
+                    ).item()
+                    # 冲突时（cos_sim < 0）线性收缩 loss_w 权重
+                    # cos_sim ∈ (-1, 0) → conflict_scale ∈ (0, 1)
+                    # cos_sim ∈ [0, 1]  → conflict_scale = 1（不干预）
+                    conflict_scale = max(0.0, 1.0 + cos_sim_val)
         else:
             loss_w = torch.tensor(0.0, device=trajectory.device)
 
         # ── Combined loss ─────────────────────────────────────────────────────
-        total_loss = loss_diffusion + w_coeff * loss_w
+        total_loss = loss_diffusion + w_coeff * conflict_scale * loss_w
 
         self._train_step += 1
 
         info = {
-            "loss_diffusion":    loss_diffusion.item(),
-            "loss_wasserstein":  loss_w_val,
-            "loss_phi":          loss_phi_val,
+            "loss_diffusion":     loss_diffusion.item(),
+            "loss_wasserstein":   loss_w_val,
+            "loss_phi":           loss_phi_val,
             "wasserstein_weight": w_coeff,
-            "train_step":        self._train_step,
+            "grad_cos_sim":       cos_sim_val,    # 负值=冲突，趋近0=正常
+            "conflict_scale":     conflict_scale,  # 实际乘进去的缩放系数
+            "train_step":         self._train_step,
         }
         return total_loss, info
 
@@ -529,7 +561,8 @@ class CTRLFlow1Policy(PreTrainedPolicy):
         """Run batch through the model; return (total_loss, info_dict).
 
         ``info`` contains individual loss components for logging:
-            loss_diffusion, loss_wasserstein, loss_phi, wasserstein_weight
+            loss_diffusion, loss_wasserstein, loss_phi, wasserstein_weight,
+            grad_cos_sim (负值表示梯度冲突), conflict_scale (实际缩放系数)
         """
         if self.config.image_features:
             batch = dict(batch)
