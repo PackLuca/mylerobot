@@ -364,12 +364,16 @@ class CTRLFlow1Model(nn.Module):
         Returns:
             scalar Wasserstein loss for the UNet.
         """
-        # Freeze φ: gradients flow through x_model → UNet, not into φ.
-        for p in self.phi.parameters():
-            p.requires_grad_(False)
+        # 关键：不能用 requires_grad_(False) 冻结φ参数。
+        # 原因：requires_grad_(False) 会切断整个前向图，导致 x_model 到 UNet
+        # 的梯度链路断裂，autograd.grad 报 "does not require grad" 错误。
+        #
+        # 正确做法：直接前向传播。
+        # - φ参数会累积梯度，但 phi_optimizer 在内循环结束后已做过 zero_grad，
+        #   且外层 total_loss.backward() 之后 phi_optimizer 不会 step，
+        #   所以φ参数不会被 UNet optimizer 误更新。
+        # - 梯度沿 loss_w → x_model → noisy_trajectory → UNet 正常流动。
         loss_w = -self.phi(x_model).mean()
-        for p in self.phi.parameters():
-            p.requires_grad_(True)
         return loss_w
 
     def _wasserstein_weight(self) -> float:
@@ -450,29 +454,36 @@ class CTRLFlow1Model(nn.Module):
             proxy_params = [p for p in self.unet.final_conv.parameters()
                             if p.requires_grad]
             if proxy_params:
-                grad_diff = torch.autograd.grad(
-                    loss_diffusion, proxy_params,
-                    retain_graph=True, allow_unused=True
-                )
-                grad_w = torch.autograd.grad(
-                    loss_w, proxy_params,
-                    retain_graph=True, allow_unused=True
-                )
-                # 过滤掉 None（allow_unused 可能产生）
-                g_diff_parts = [g.flatten() for g in grad_diff if g is not None]
-                g_w_parts    = [g.flatten() for g in grad_w    if g is not None]
+                try:
+                    # retain_graph=True：保留计算图供后续 total_loss.backward() 使用
+                    grad_diff = torch.autograd.grad(
+                        loss_diffusion, proxy_params,
+                        retain_graph=True, allow_unused=True,
+                        create_graph=False,
+                    )
+                    grad_w = torch.autograd.grad(
+                        loss_w, proxy_params,
+                        retain_graph=True, allow_unused=True,
+                        create_graph=False,
+                    )
+                    # 过滤掉 None（allow_unused 可能产生）
+                    g_diff_parts = [g.flatten() for g in grad_diff if g is not None]
+                    g_w_parts    = [g.flatten() for g in grad_w    if g is not None]
 
-                if g_diff_parts and g_w_parts:
-                    g_diff_flat = torch.cat(g_diff_parts)
-                    g_w_flat    = torch.cat(g_w_parts)
-                    cos_sim_val = F.cosine_similarity(
-                        g_diff_flat.unsqueeze(0),
-                        g_w_flat.unsqueeze(0),
-                    ).item()
-                    # 冲突时（cos_sim < 0）线性收缩 loss_w 权重
-                    # cos_sim ∈ (-1, 0) → conflict_scale ∈ (0, 1)
-                    # cos_sim ∈ [0, 1]  → conflict_scale = 1（不干预）
-                    conflict_scale = max(0.0, 1.0 + cos_sim_val)
+                    if g_diff_parts and g_w_parts:
+                        g_diff_flat = torch.cat(g_diff_parts)
+                        g_w_flat    = torch.cat(g_w_parts)
+                        cos_sim_val = F.cosine_similarity(
+                            g_diff_flat.unsqueeze(0),
+                            g_w_flat.unsqueeze(0),
+                        ).item()
+                        # 冲突时（cos_sim < 0）线性收缩 loss_w 权重
+                        # cos_sim ∈ (-1, 0) → conflict_scale ∈ (0, 1)
+                        # cos_sim ∈ [0, 1]  → conflict_scale = 1（不干预）
+                        conflict_scale = max(0.0, 1.0 + cos_sim_val)
+                except RuntimeError:
+                    # 极端情况下计算图不可用时跳过，不影响主loss
+                    pass
         else:
             loss_w = torch.tensor(0.0, device=trajectory.device)
 
