@@ -116,13 +116,13 @@ class CTRLFlow1Config(PreTrainedConfig):
     # ── Kantorovich potential network φ (NEW) ────────────────────────────────
     phi_hidden_dim: int = 256
     phi_n_layers: int = 3
-    phi_lr: float = 1e-3           # ~10x unet lr; φ needs to converge faster
-    phi_n_inner_steps: int = 5     # WGAN-style: n_critic steps per generator step
-    phi_gp_lambda: float = 10.0   # gradient-penalty coefficient (WGAN-GP default)
+    phi_lr: float = 5e-4           # ~10x unet lr; φ needs to converge faster
+    phi_n_inner_steps: int = 3     # WGAN-style: n_critic steps per generator step
+    phi_gp_lambda: float = 15.0   # gradient-penalty coefficient (WGAN-GP default)
 
     # ── Wasserstein regularisation schedule (NEW) ────────────────────────────
-    wasserstein_lambda: float = 0.05   # start small; tune if loss_w >> loss_diff
-    wasserstein_warmup_steps: int = 2000  # ramp from 0 → wasserstein_lambda
+    wasserstein_lambda: float = 0.005   # start small; tune if loss_w >> loss_diff
+    wasserstein_warmup_steps: int = 5000  # ramp from 0 → wasserstein_lambda
 
     def __post_init__(self):
         super().__post_init__()
