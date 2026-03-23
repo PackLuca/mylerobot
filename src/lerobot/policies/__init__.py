@@ -31,6 +31,7 @@ from .ctrlflow.configuration_ctrlflow import CtrlFlowConfig as CtrlFlowConfig
 #Ctrl-Flow1(Wasserstein) 相关配置
 from .ctrlflow1.configuration_ctrlflow1 import CTRLFlow1Config as CTRLFlow1Config
 
+from .ctrlflow2.configuration_ctrlflow2 import CtrlFlow2Config as CtrlFlow2Config
 
 __all__ = [
     "ACTConfig",
@@ -50,4 +51,5 @@ __all__ = [
     # Flow Matching 相关配置
     "CtrlFlowConfig",
     "CTRLFlow1Config",
+    "CtrlFlow2Config",
 ]
