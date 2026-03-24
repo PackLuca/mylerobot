@@ -28,89 +28,88 @@ from lerobot.optim.schedulers import DiffuserSchedulerConfig
 class CTRLFlowConfig(PreTrainedConfig):
     """Configuration class for CTRLFlowPolicy.
 
-    Strictly implements the CTRL-Flow framework (Ma, 2024) §4.3.1
-    Gradient Flow Construction with the exact drift and diffusion from the paper:
+    Faithful implementation of the CTRL-Flow framework (Ma, 2024) Theorem 1.
 
-        f(x, t) = -∇_x u_t(x) = -∇_x log( p_t(x) / p_data(x) )
-        g = sqrt(2) * I
+    ── SDE specification (paper §4.3.1) ────────────────────────────────────
 
-    Theorem 1 verification (α = β = 1, Lyapunov functional L = KL divergence):
+        f(x, t) = -∇_x log( p_t(x) / p_data(x) )
+        g = sqrt(2) · I
 
-        Condition 1 — Drift-Dissipation Matching:
-            ∫ <f, ∇δL/δρ> p dx
-            = -∫ ||∇_x log(p_t/p_data)||² p dx
-            = -Φ  ✓  (with α = 1)
+    ── Probability path ────────────────────────────────────────────────────
 
-        Condition 2 — Diffusion-Enhanced Dissipation  (g = sqrt(2)*I):
-            ½ ∫ tr[g g^T ∇²_x δL/δρ] p dx
-            = ∫ Δ_x log(p_t/p_data) p dx
-            = -∫ ||∇_x log p_t||² p dx
-            ≈ -Φ  ✓  (with β = 1, by integration by parts)
+    Straight-line interpolation:
+        x_t = (1 - t) · x_0  +  t · ε,    t ∈ [0, t_max],  t_max < 1
+        x_0 ~ p_data,   ε ~ N(0, I)
 
-    Inference uses the Euler-Maruyama discretisation of the SDE:
+    ── Training target ─────────────────────────────────────────────────────
 
-        x_{t-Δt} = x_t  +  Δt · f_θ(x_t, t)  +  sqrt(2Δt) · ε,   ε ~ N(0, I)
-                   └─── drift term ──────────┘   └─ diffusion term ─┘
-                         (deterministic)              (stochastic)
+    The score difference along the straight path evaluates to:
 
-    where Δt = 1 / num_sde_steps.
+        -∇_x log( p_t(x_t) / p_data(x_t) )  ≈  (x_0 - ε) / (1 - t)
 
-    Training minimises:
+    This is dimensionally correct: as t→0, target → x_0 - ε (O(1));
+    as t→t_max, target grows as 1/t_min_gap (bounded by construction).
 
-        L = score_loss_weight · L_score  +  lyapunov_lambda · L_lyapunov
+        target(t) = (x_0 - ε) / (1 - t)
 
-        L_score    = MSE( f_θ(x_t, t),  -∇_x log(p_t/p_data) )
-                   ≈ MSE( f_θ(x_t, t),  action - noise )        [straight path]
+    ── Inference ───────────────────────────────────────────────────────────
 
-        L_lyapunov = E[ max(0,  <f_θ, ∇δL/δρ>  +  Φ) ]
-                                 ↑ Condition 1 residual
+    Reverse SDE (Anderson 1982, consistent with Theorem 1):
+        dx = f_θ(x, t) dt  +  sqrt(2) dW̄_t
+
+    Euler-Maruyama (t decreases from t_max to 0, step size Δt):
+        x_{k+1} = x_k  +  Δt · f_θ(x_k, t_k)  +  sqrt(2·Δt) · ε_k
+
+    Initial sample: x ~ N(0, I)  [marginal of x_t at t=t_max ≈ N(0,I)
+    when t_max is close to 1 and x_0 is normalised].
+
+    ── Lyapunov regulariser (Theorem 1, Condition 1) ───────────────────────
+
+        R(θ) = ||f_θ(x_t, t)||²  -  ||target(t)||²
+        L_lyapunov = E[ max(0, R(θ)) ]
+
+    Both terms carry the same 1/(1-t) scaling, so R is dimensionally
+    consistent and the hinge correctly penalises magnitude overshoot.
 
     Args:
-        n_obs_steps: Number of environment steps worth of observations to pass.
-        horizon: Action prediction horizon. Must be divisible by
-            2**len(down_dims) due to UNet downsampling.
-        n_action_steps: Number of actions to execute per policy invocation.
-        normalization_mapping: Maps FeatureType strings to NormalizationMode.
-        drop_n_last_frames: Frames dropped at trajectory end to avoid padding.
-        vision_backbone: torchvision ResNet backbone name.
-        resize_shape: (H, W) to resize images before backbone.
-        crop_ratio: Fraction of resize_shape used as crop size (in (0, 1]).
-        crop_shape: (H, W) explicit crop shape (overrides crop_ratio path).
-        crop_is_random: Random crop at train time; center crop at eval.
-        pretrained_backbone_weights: torchvision pretrained weight identifier.
-        use_group_norm: Replace BatchNorm with GroupNorm in the backbone.
-        spatial_softmax_num_keypoints: Number of SpatialSoftmax keypoints.
-        use_separate_rgb_encoder_per_camera: One RGB encoder per camera view.
-        down_dims: UNet temporal downsampling feature dimensions per stage.
-        kernel_size: UNet 1-D convolutional kernel size.
-        n_groups: GroupNorm group count in UNet residual blocks.
-        diffusion_step_embed_dim: Output dim of the timestep embedding MLP.
-        use_film_scale_modulation: Enable FiLM scale modulation in UNet.
-        num_sde_steps: Number of Euler-Maruyama steps at inference.
-            Δt = 1 / num_sde_steps.  Larger values → lower discretisation
-            error but more UNet evaluations.
-        sde_noise_scale: Multiplier s on the diffusion term at inference:
-            g_eff = s * sqrt(2) * I.
-            s = 1.0  →  exact paper design  g = sqrt(2)*I  (default).
-            s = 0.0  →  ablation: pure deterministic ODE (no diffusion).
-            Intermediate values allow studying the effect of diffusion strength.
-        score_loss_weight: Weight for the primary score-matching MSE loss.
-        lyapunov_lambda: Weight λ ≥ 0 for the Lyapunov regulariser.
-            λ = 0.0  →  plain score matching, no stability constraint.
-            λ > 0.0  →  penalise violations of Drift-Dissipation Matching.
-        do_mask_loss_for_padding: Mask loss on copy-padded action entries.
-        compile_model: Apply torch.compile to the UNet for faster inference.
-        compile_mode: torch.compile mode string (e.g. "reduce-overhead").
-        optimizer_lr: Adam learning rate.
-        optimizer_betas: Adam (β₁, β₂).
-        optimizer_eps: Adam ε for numerical stability.
-        optimizer_weight_decay: Adam weight decay.
-        scheduler_name: LR scheduler name passed to DiffuserSchedulerConfig.
-        scheduler_warmup_steps: Number of LR warmup steps.
+        n_obs_steps: Observation history length.
+        horizon: Action prediction horizon (must be divisible by
+            2**len(down_dims)).
+        n_action_steps: Actions executed per policy invocation.
+        normalization_mapping: FeatureType → NormalizationMode.
+        drop_n_last_frames: Frames dropped at trajectory end.
+        vision_backbone: torchvision ResNet variant name.
+        resize_shape: (H, W) image resize before backbone.
+        crop_ratio: Crop size as fraction of resize_shape.
+        crop_shape: Explicit (H, W) crop (overrides crop_ratio).
+        crop_is_random: Random crop (train) / center crop (eval).
+        pretrained_backbone_weights: torchvision weight identifier.
+        use_group_norm: GroupNorm instead of BatchNorm in backbone.
+        spatial_softmax_num_keypoints: SpatialSoftmax keypoint count.
+        use_separate_rgb_encoder_per_camera: One encoder per camera.
+        down_dims: UNet downsampling feature dims per stage.
+        kernel_size: UNet 1-D conv kernel size.
+        n_groups: GroupNorm groups in UNet residual blocks.
+        diffusion_step_embed_dim: Timestep embedding output dim.
+        use_film_scale_modulation: FiLM scale modulation in UNet.
+        t_min_gap: Gap from t=1; t_max = 1 - t_min_gap.
+            Prevents 1/(1-t) from diverging. Default 0.01 bounds
+            target magnitude at 1/0.01 = 100.
+        num_sde_steps: Euler-Maruyama steps at inference.
+        sde_noise_scale: Diffusion multiplier s; g_eff = s·sqrt(2)·I.
+            s=1 → paper design. s=0 → deterministic ODE ablation.
+        score_loss_weight: Weight for L_score.
+        lyapunov_lambda: Weight λ ≥ 0 for L_lyapunov.
+        do_mask_loss_for_padding: Mask padded action loss entries.
+        compile_model: torch.compile the UNet.
+        compile_mode: torch.compile mode string.
+        optimizer_lr / betas / eps / weight_decay: Adam hyperparams.
+        scheduler_name: LR scheduler identifier.
+        scheduler_warmup_steps: LR warmup steps.
     """
 
     # ------------------------------------------------------------------ #
-    # Inputs / output structure
+    # Inputs / outputs
     # ------------------------------------------------------------------ #
     n_obs_steps: int = 2
     horizon: int = 16
@@ -119,14 +118,14 @@ class CTRLFlowConfig(PreTrainedConfig):
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
-            "STATE": NormalizationMode.MIN_MAX,
+            "STATE":  NormalizationMode.MIN_MAX,
             "ACTION": NormalizationMode.MIN_MAX,
         }
     )
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+    drop_n_last_frames: int = 7
 
     # ------------------------------------------------------------------ #
-    # Vision encoder — identical to DiffusionConfig
+    # Vision encoder
     # ------------------------------------------------------------------ #
     vision_backbone: str = "resnet18"
     resize_shape: tuple[int, int] | None = None
@@ -139,7 +138,7 @@ class CTRLFlowConfig(PreTrainedConfig):
     use_separate_rgb_encoder_per_camera: bool = False
 
     # ------------------------------------------------------------------ #
-    # UNet architecture — identical to DiffusionConfig
+    # UNet
     # ------------------------------------------------------------------ #
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
@@ -148,18 +147,24 @@ class CTRLFlowConfig(PreTrainedConfig):
     use_film_scale_modulation: bool = True
 
     # ------------------------------------------------------------------ #
-    # CTRL-Flow SDE parameters
-    # Paper: f(x,t) = -∇_x log(p_t/p_data),  g = sqrt(2)*I
-    # Euler-Maruyama: x_{t-Δt} = x_t + Δt·f_θ + sqrt(2Δt)·ε
+    # CTRL-Flow time schedule
+    # t ∈ [0, t_max],  t_max = 1 - t_min_gap
+    # Δt = t_max / num_sde_steps
     # ------------------------------------------------------------------ #
-    num_sde_steps: int = 10         # number of integration steps (Δt = 1/N)
-    sde_noise_scale: float = 1.0    # s: g_eff = s·sqrt(2)·I; 1.0 = paper design
+    t_min_gap: float = 0.01     # t_max = 1 - t_min_gap; bounds 1/(1-t)
+    num_sde_steps: int = 10     # Euler-Maruyama steps at inference
+
+    # ------------------------------------------------------------------ #
+    # CTRL-Flow SDE diffusion  (paper: g = sqrt(2)·I)
+    # g_eff = sde_noise_scale * sqrt(2) · I
+    # ------------------------------------------------------------------ #
+    sde_noise_scale: float = 1.0
 
     # ------------------------------------------------------------------ #
     # Training loss
     # ------------------------------------------------------------------ #
-    score_loss_weight: float = 1.0  # weight for L_score (MSE)
-    lyapunov_lambda: float = 0.1    # weight λ for L_lyapunov (Drift-Dissipation)
+    score_loss_weight: float = 1.0
+    lyapunov_lambda: float = 0.1
 
     # ------------------------------------------------------------------ #
     # Misc
@@ -169,7 +174,7 @@ class CTRLFlowConfig(PreTrainedConfig):
     compile_mode: str = "reduce-overhead"
 
     # ------------------------------------------------------------------ #
-    # Optimisation presets — same defaults as DiffusionConfig
+    # Optimisation
     # ------------------------------------------------------------------ #
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)
@@ -184,8 +189,10 @@ class CTRLFlowConfig(PreTrainedConfig):
 
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"`vision_backbone` must be a ResNet variant. Got {self.vision_backbone}."
             )
+        if not (0.0 < self.t_min_gap < 1.0):
+            raise ValueError(f"`t_min_gap` must be in (0, 1). Got {self.t_min_gap}.")
         if self.num_sde_steps < 1:
             raise ValueError(f"`num_sde_steps` must be >= 1. Got {self.num_sde_steps}.")
         if self.sde_noise_scale < 0.0:
@@ -195,59 +202,56 @@ class CTRLFlowConfig(PreTrainedConfig):
         if self.score_loss_weight <= 0.0:
             raise ValueError(f"`score_loss_weight` must be > 0. Got {self.score_loss_weight}.")
 
-        if self.resize_shape is not None and (
-            len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
-        ):
-            raise ValueError(
-                f"`resize_shape` must be a pair of positive integers. Got {self.resize_shape}."
-            )
-        if not (0 < self.crop_ratio <= 1.0):
-            raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
-
         if self.resize_shape is not None:
-            self.crop_shape = (
-                (
+            if len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape):
+                raise ValueError(
+                    f"`resize_shape` must be two positive ints. Got {self.resize_shape}."
+                )
+            if self.crop_ratio < 1.0:
+                self.crop_shape = (
                     int(self.resize_shape[0] * self.crop_ratio),
                     int(self.resize_shape[1] * self.crop_ratio),
                 )
-                if self.crop_ratio < 1.0
-                else None
-            )
+
+        if not (0 < self.crop_ratio <= 1.0):
+            raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
 
         if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
-            raise ValueError(f"`crop_shape` must have positive dimensions. Got {self.crop_shape}.")
+            raise ValueError(f"`crop_shape` must have positive dims. Got {self.crop_shape}.")
 
         downsampling_factor = 2 ** len(self.down_dims)
         if self.horizon % downsampling_factor != 0:
             raise ValueError(
-                "The horizon must be divisible by the UNet downsampling factor "
-                f"2**len(down_dims)={downsampling_factor}. "
+                f"horizon must be divisible by 2**len(down_dims)={downsampling_factor}. "
                 f"Got {self.horizon=} and {self.down_dims=}."
             )
 
     # ------------------------------------------------------------------ #
-    # Derived quantities used by CTRLFlowModel
+    # Derived quantities
     # ------------------------------------------------------------------ #
 
     @property
+    def t_max(self) -> float:
+        """Upper integration bound: t_max = 1 - t_min_gap < 1.
+        Prevents target = (x0 - eps)/(1-t) from diverging.
+        """
+        return 1.0 - self.t_min_gap
+
+    @property
     def dt(self) -> float:
-        """Euler-Maruyama step size  Δt = 1 / num_sde_steps."""
-        return 1.0 / self.num_sde_steps
+        """Euler-Maruyama step size: Δt = t_max / num_sde_steps."""
+        return self.t_max / self.num_sde_steps
 
     @property
     def g_coeff(self) -> float:
-        """Effective diffusion coefficient magnitude at inference.
-
-        Paper design: g = sqrt(2) * I  →  g_coeff = sqrt(2).
-        With sde_noise_scale s: g_coeff = s * sqrt(2).
-
-        The Euler-Maruyama diffusion increment per step is:
-            sqrt(g² · Δt) · ε = sqrt(2 · sde_noise_scale² · Δt) · ε
+        """Effective diffusion magnitude: sde_noise_scale * sqrt(2).
+        Paper design: sde_noise_scale=1 → g_coeff = sqrt(2).
+        Diffusion std per EM step: g_coeff * sqrt(Δt).
         """
         return self.sde_noise_scale * math.sqrt(2.0)
 
     # ------------------------------------------------------------------ #
-    # LeRobot framework hooks
+    # LeRobot hooks
     # ------------------------------------------------------------------ #
 
     def get_optimizer_preset(self) -> AdamConfig:
@@ -267,21 +271,25 @@ class CTRLFlowConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError(
-                "You must provide at least one image or the environment state among the inputs."
+                "Provide at least one image or the environment state as input."
             )
         if self.resize_shape is None and self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
-                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
+                if (
+                    self.crop_shape[0] > image_ft.shape[1]
+                    or self.crop_shape[1] > image_ft.shape[2]
+                ):
                     raise ValueError(
-                        f"`crop_shape` {self.crop_shape} exceeds image shape {image_ft.shape} "
-                        f"for key `{key}`."
+                        f"`crop_shape` {self.crop_shape} exceeds image shape "
+                        f"{image_ft.shape} for key `{key}`."
                     )
         if len(self.image_features) > 0:
             first_key, first_ft = next(iter(self.image_features.items()))
             for key, ft in self.image_features.items():
                 if ft.shape != first_ft.shape:
                     raise ValueError(
-                        f"Image shape mismatch: `{key}` {ft.shape} != `{first_key}` {first_ft.shape}."
+                        f"Image shape mismatch: `{key}` {ft.shape} != "
+                        f"`{first_key}` {first_ft.shape}."
                     )
 
     @property
