@@ -301,12 +301,15 @@ class CTRLFlowModel(nn.Module):
         for k in range(cfg.num_sde_steps):
             t_k = cfg.t_max - k * dt                    # current t (decreasing)
 
-            t_batch = torch.full(
-                (batch_size,), t_k, dtype=dtype, device=device
+            #t_batch = torch.full(
+            #    (batch_size,), t_k, dtype=dtype, device=device
+            #)
+            t_embed = torch.full(
+                (batch_size,), int(t_k * 1000), dtype=torch.long, device=device
             )
 
             # v_θ(x_k, t_k) ≈ (x_0 - ε)   [unscaled, O(1)]
-            v = self.unet(x, t_batch, global_cond=global_cond)
+            v = self.unet(x, t_embed, global_cond=global_cond)
 
             # Drift: f_θ = v_θ / (1 - t_k)
             one_minus_t_k = max(1.0 - t_k, cfg.t_min_gap)
@@ -437,7 +440,8 @@ class CTRLFlowModel(nn.Module):
         target_unscaled = x0 - eps                      # (B, T, D)  O(1)
 
         # ── 4. UNet prediction: v_θ(x_t, t) ≈ (x_0 - ε) ───────────────
-        pred_unscaled = self.unet(x_t, t, global_cond=global_cond)  # (B, T, D)
+        t_embed = (t * 1000).long() 
+        pred_unscaled = self.unet(x_t, t_embed, global_cond=global_cond)  # (B, T, D)
 
         # ── 5. Score-matching loss (weighted, gradient-stable) ──────────
         score_loss = F.mse_loss(
