@@ -162,6 +162,7 @@ class FlowModel(nn.Module):
 
     # ========= inference  ============
     #修改推理逻辑。
+    @torch.no_grad()
     def conditional_sample(
         self,
         batch_size: int,
@@ -170,7 +171,8 @@ class FlowModel(nn.Module):
         noise: Tensor | None = None,
     ) -> Tensor:
         """
-        修改后的 Flow Matching 推理逻辑 (Euler Method)
+        修改后的 CTRL-Flow 推理逻辑 (Euler-Maruyama SDE Solver)
+        支持扩散项 g = sqrt(2)
         """
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -190,29 +192,37 @@ class FlowModel(nn.Module):
             )
         )
 
-        # 2. 准备 ODE 积分参数
+        # 2. 准备 SDE 积分参数
         # 积分步数在 FlowConfig 中定义
         num_steps = self.config.num_flow_steps
         dt = 1.0 / num_steps
+        # 如果你在 config 中定义了该参数，建议使用 self.config.diffusion_g
+        g = math.sqrt(2.0)
 
-        # 3. 迭代积分 (Euler 积分器)
-        # 我们从 t=0 (噪声) 走到 t=1 (数据)
+        # 3. 迭代积分 (Euler-Maruyama 积分器)
         for i in range(num_steps):
             # 当前时间点 t 属于 [0, 1)
             t_val = i / num_steps
             t = torch.full((batch_size,), t_val, device=device, dtype=dtype)
 
-            # 预测当前位置的速度向量 (Velocity)
-            # 注意：这里的 self.unet 实际上扮演了 Vector Field 的角色
-            v_t = self.unet(
+            # 预测当前位置的漂移项 (Drift Term) f(x, t)
+            # 注意：这里的 self.unet 预测的是包含 score 补偿的完整 f
+            f_t = self.unet(
                 x,
                 t,  # 传入连续的时间步
                 global_cond=global_cond,
             )
 
-            # Euler 更新：x_{t+dt} = x_t + v_t * dt
-            x = x + v_t * dt
+            # 采样布朗运动增量 dW ~ N(0, dt*I)
+            # 对应到代码实现即为：sqrt(dt) * epsilon
+            brownian_noise = torch.randn_like(x, generator=generator)
 
+            # Euler-Maruyama 更新步骤:
+            # x = x + drift * dt + g * sqrt(dt) * noise
+            # 注意：最后一步 (i == num_steps - 1) 有时会去掉噪声以获得更干净的输出，
+            # 但标准的 SDE 采样通常全程保留噪声。
+            diffusion_step = g * math.sqrt(dt) * brownian_noise
+            x = x + f_t * dt + diffusion_step
         # 4. 最终得到的 x 即为生成的动作轨迹
         return x
     
@@ -284,7 +294,7 @@ class FlowModel(nn.Module):
     #修改训练逻辑。
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """
-        修改后的 Flow Matching 损失计算函数
+        修改后的 CTRL-Flow 损失计算函数 (支持 g=sqrt(2) 扩散项)
         """
         # 1. 基础验证与参数提取 (复用自 DiffusionPolicy)
         # OBS_STATE, ACTION 等常量通常在文件头部定义
@@ -296,30 +306,41 @@ class FlowModel(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         # 2. 提取全局特征 该方法会处理图像 ResNet 编码和状态向量的拼接
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)       
 
-        # 3. Flow Matching 核心逻辑
-        x_1 = batch[ACTION]            # 目标轨迹 (Clean Action)
-        x_0 = torch.randn_like(x_1)    # 初始噪声 (Gaussian Noise)
-        
-        # 采样连续时间步 t ~ U([0, 1])
+        # 3. 数据准备
+        x_1 = batch[ACTION]            # 目标轨迹
+        x_0 = torch.randn_like(x_1)    # 初始噪声
         batch_size = x_1.shape[0]
-        t = torch.rand((batch_size,), device=x_1.device, dtype=x_1.dtype)
-        t_reshaped = t.view(-1, 1, 1)
         
-        # 构建 Optimal Transport 路径 (线性插值)
-        # x_t = (1 - t) * x_0 + t * x_1
+        # 采样连续时间步 t，限制范围以保证数值稳定性 (防止 score 爆炸)
+        # 建议范围 [1e-3, 1 - 1e-3]
+        t = (torch.rand((batch_size,), device=x_1.device, dtype=x_1.dtype) * 0.998) + 0.001
+        t_reshaped = t.view(-1, 1, 1)
+        # 构建插值路径 x_t
         x_t = (1.0 - t_reshaped) * x_0 + t_reshaped * x_1
         
-        # 目标速度 (Target Velocity) v_t = d(x_t)/dt = x_1 - x_0
-        v_t = x_1 - x_0
+        # --- CTRL-Flow 核心：计算组合漂移项目标 f_target ---
         
-        # 4. 前向传播预测速度场
-        # 注意：原本的 Unet 期待整数 timestep，如果是浮点数 t，建议在传入前乘以 1000 或在 Unet 内部适配连续时间嵌入
-        pred = self.unet(x_t, t, global_cond=global_cond)
+        # (A) 概率流项 (Probability Flow / Flow Matching): v_t = x_1 - x_0
+        v_flow = x_1 - x_0
+        # (B) 得分函数项 (Score Function): 
+        # 对于高斯路径 p(xt|x1), score = grad_xt log p(xt|x1) = -(xt - t*x1) / (1-t)^2
+        # 注意：这是为了抵消 g=sqrt(2) 产生的扩散效应
+        score_target = -(x_t - t_reshaped * x_1) / ((1.0 - t_reshaped) ** 2)
+        # (C) 组合目标 f_target = v_flow + score_target
+        f_target = v_flow + score_target
+
+        # 4. 前向传播预测漂移项 f (即网络预测的控制力)
+        f_pred = self.unet(x_t, t, global_cond=global_cond)
+        # --- 数值稳定性处理：损失加权 ---
+        # 使用 (1-t)^2 作为权重，正好抵消 score 项的分母，使 Loss 量级在全时间段保持稳定
+        # 这样网络直接拟合的是 f，但梯度被限制在了合理范围内
+        loss_weight = (1.0 - t_reshaped) ** 2
         
-        # 5. 计算损失
-        loss = F.mse_loss(pred, v_t, reduction="none")
+        # 5. 计算损失 (在 MSE 内部应用权重)
+        # 我们希望 f_pred 逼近 f_target
+        loss = F.mse_loss(f_pred * loss_weight, f_target * loss_weight, reduction="none")
 
         # 6. 掩码逻辑 (处理轨迹填充部分)
         if self.config.do_mask_loss_for_padding:

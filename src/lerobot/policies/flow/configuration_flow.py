@@ -46,9 +46,10 @@ class FlowConfig(PreTrainedConfig):
     use_film_scale_modulation: bool = True
     
     # 新增 flow 特有的参数
-    num_flow_steps: int = 10  # 推理ODE步数
-    flow_sampling_method: str = "euler"  # euler / rk4
+    num_flow_steps: int = 30  # 推理SDE步数，需要比ODE多
+    flow_sampling_method: str = "sde" # euler-maruyama"
     flow_loss_type: str = "mse"  # velocity regression
+    diffusion_g: float = 1.4142
     #flow_timestep_embed_dim: int = 128
 
     # Optimization
@@ -56,7 +57,7 @@ class FlowConfig(PreTrainedConfig):
     compile_mode: str = "reduce-overhead"
 
     # Loss computation
-    do_mask_loss_for_padding: bool = False
+    do_mask_loss_for_padding: bool = True # 修改过
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -64,7 +65,7 @@ class FlowConfig(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6
     scheduler_name: str = "cosine"
-    scheduler_warmup_steps: int = 500
+    scheduler_warmup_steps: int = 1500 # 修改过
 
     def __post_init__(self):
         """Input validation (not exhaustive)."""
@@ -75,7 +76,7 @@ class FlowConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
         
-        supported_sampling = ["euler", "rk4"]
+        supported_sampling = ["euler", "rk4", "sde"]
         if self.flow_sampling_method not in supported_sampling:
             raise ValueError(
                 f"`flow_sampling_method` must be one of {supported_sampling}. "
