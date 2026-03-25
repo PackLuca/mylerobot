@@ -151,14 +151,14 @@ class CTRLFlowConfig(PreTrainedConfig):
     # t ∈ [0, t_max],  t_max = 1 - t_min_gap
     # Δt = t_max / num_sde_steps
     # ------------------------------------------------------------------ #
-    t_min_gap: float = 0.05     # t_max = 1 - t_min_gap; bounds 1/(1-t)
-    num_sde_steps: int = 100     # Euler-Maruyama steps at inference
+    t_min_gap: float = 0.01     # t_max = 1 - t_min_gap; bounds 1/(1-t)
+    num_sde_steps: int = 10     # Euler-Maruyama steps at inference
 
     # ------------------------------------------------------------------ #
     # CTRL-Flow SDE diffusion  (paper: g = sqrt(2)·I)
     # g_eff = sde_noise_scale * sqrt(2) · I
     # ------------------------------------------------------------------ #
-    sde_noise_scale: float = 0.5
+    sde_noise_scale: float = 1
 
     # ------------------------------------------------------------------ #
     # Training loss

@@ -30,28 +30,20 @@ Probability path (straight-line interpolation):
 
 Training target — score difference along the straight path:
 
-    -∇_{x_t} log p_t(x_t | x_0)  =  -(x_t - x_0) / (1-t)²  · (1-t)
-                                   =  (x_0 - x_t) / (1-t)
-                                   =  (x_0 - ε) · (1-t) / (1-t)   ... wait
+    The true drift target is:
+        f(x_t, t) ≈ (x_0 - ε) / (1 - t)              [score-difference units]
 
-    More carefully: x_t = (1-t)x_0 + tε, so
-        x_t - x_0 = t(ε - x_0)
-    The conditional "drift" pointing back to x_0 from x_t is:
-        (x_0 - x_t) / (1-t)  =  -t(ε - x_0)/(1-t)  =  t(x_0 - ε)/(1-t)
+    To avoid large gradients near t_max (where 1/(1-t) → 1/t_min_gap),
+    the UNet is trained to predict the *unscaled* tangent vector instead:
 
-    But we want -∇ log(p_t/p_data), which for the straight-path marginal
-    is approximated (in expectation over x_0|x_t) as the vector field
-    that generates the path, rescaled to unit-time parametrisation:
+        v_θ(x_t, t)  ≈  (x_0 - ε)                    [O(1), gradient-stable]
 
-        f(x_t, t)  ≈  E[x_0 - ε | x_t] / (1 - t)
+    with a weighted MSE loss:
+        L_score = E[ ||v_θ(x_t,t) - (x_0-ε)||² ]
+                = E[ (1-t)² · ||f_θ - target||² ]      [equivalent]
 
-    The regression target for a single (x_0, ε) sample is therefore:
-
-        target(x_0, ε, t)  =  (x_0 - ε) / (1 - t)              ... (★)
-
-    Note: (x_0 - ε) is the unnormalised tangent; dividing by (1-t) converts
-    it to the correct score-difference units (action / time), matching the
-    physical dimensions of f in the Fokker-Planck equation.
+    At inference the drift is recovered by:
+        f_θ(x_t, t) = v_θ(x_t, t) / (1 - t)
 
 Inference — Euler-Maruyama reverse SDE (t_max → 0):
     x_{k+1} = x_k  +  Δt · f_θ(x_k, t_k)  +  sqrt(2·Δt) · ε_k
@@ -298,7 +290,7 @@ class CTRLFlowModel(nn.Module):
             x = torch.randn(
                 (batch_size, cfg.horizon, action_dim),
                 dtype=dtype, device=device, generator=generator,
-            )
+            ) * cfg.t_max
 
         dt       = cfg.dt                               # Δt = t_max / N
         diff_std = cfg.g_coeff * math.sqrt(dt)          # sqrt(2·Δt)
@@ -313,8 +305,13 @@ class CTRLFlowModel(nn.Module):
                 (batch_size,), t_k, dtype=dtype, device=device
             )                                           # (B,)
 
-            # f_θ(x_k, t_k) ≈ (x_0 - ε) / (1 - t_k)
-            drift = self.unet(x, t_batch, global_cond=global_cond)  # (B,T,D)
+            # v_θ(x_k, t_k) ≈ (x_0 - ε)   [unscaled tangent, O(1)]
+            v = self.unet(x, t_batch, global_cond=global_cond)  # (B,T,D)
+
+            # Recover drift: f_θ = v_θ / (1 - t_k)
+            # Clamp denominator to t_min_gap for numerical safety.
+            one_minus_t_k = max(1.0 - t_k, cfg.t_min_gap)
+            drift = v / one_minus_t_k                        # (B,T,D)
 
             # ── Drift step: Δt · f_θ ───────────────────────────────────
             x = x + dt * drift
@@ -362,27 +359,26 @@ class CTRLFlowModel(nn.Module):
                ε  ~ N(0, I)
                x_t = (1 - t) · x_0  +  t · ε
 
-        3. Training target — score difference (★):
-               target = (x_0 - ε) / (1 - t)
+        3. Training target — unscaled tangent vector:
+               target_unscaled = x_0 - ε                [O(1), gradient-stable]
 
-           Derivation:
-               x_t = (1-t)·x_0 + t·ε
-               dx_t/dt = ε - x_0             [tangent of straight path]
-               f(x_t,t) = -∇ log(p_t/p_data) ≈ (x_0 - ε) / (1 - t)
-                          ↑ rescale tangent to score-difference units
+           The true drift target (x_0-ε)/(1-t) diverges as t→t_max.
+           Instead we train the UNet to predict (x_0-ε) directly, which
+           is equivalent to weighting the MSE loss by (1-t)²:
+               L = E[||v_θ - (x0-ε)||²] = E[(1-t)²·||f_θ - target||²]
 
         4. UNet prediction:
-               pred = f_θ(x_t, t)
+               v_θ = UNet(x_t, t)    [predicts x_0 - ε, not the full drift]
 
         5. Score-matching loss:
-               L_score = MSE(pred, target)
+               L_score = MSE(v_θ, x_0 - ε)
 
-        6. Lyapunov regulariser (Theorem 1, Condition 1) (★★):
-               R(θ) = ||pred||² - ||target||²
+        6. Lyapunov regulariser (Theorem 1, Condition 1):
+               R(θ) = ||v_θ||² - ||x_0 - ε||²
                L_lyapunov = E[max(0, R(θ))]
 
-           Both pred and target carry the same 1/(1-t) factor, so R
-           is dimensionally consistent. The hinge penalises overshoot.
+           Computing in unscaled units is equivalent to the scaled version
+           since the (1-t)² factor cancels in the residual ratio.
 
         7. Total loss:
                L = score_loss_weight · L_score
@@ -420,25 +416,44 @@ class CTRLFlowModel(nn.Module):
         eps = torch.randn_like(x0)                      # (B, T, D) ~ N(0,I)
         x_t = (1.0 - t_view) * x0 + t_view * eps       # (B, T, D)
 
-        # ── 3. Training target: (x_0 - ε) / (1 - t) ───────────────────
-        # (1 - t) is bounded away from 0 by t_max = 1 - t_min_gap,
-        # so (1 - t) >= t_min_gap > 0 always.
-        one_minus_t = (1.0 - t_view)                    # (B, 1, 1) >= t_min_gap
-        target = (x0 - eps) / one_minus_t               # (B, T, D)
+        # ── 3. Training target ──────────────────────────────────────────
+        # The true score-difference target is (x0 - eps) / (1 - t).
+        # To avoid the 1/(1-t) blow-up causing large gradients near t_max,
+        # we instead train the UNet to predict the unscaled tangent vector:
+        #
+        #     UNet output v_θ(x_t, t)  ≈  (x_0 - ε)          [O(1)]
+        #
+        # and recover the drift at inference via:
+        #     f_θ(x_t, t) = v_θ(x_t, t) / (1 - t)
+        #
+        # Equivalently, the weighted MSE loss is:
+        #     L = E[ ||(1-t)·f_θ - (x0-ε)||² ]
+        #       = E[ ||v_θ - (x0-ε)||² ]
+        #
+        # This keeps gradient norms O(1) regardless of t_min_gap.
+        one_minus_t    = (1.0 - t_view)                 # (B, 1, 1) >= t_min_gap
+        target_unscaled = x0 - eps                      # (B, T, D)  O(1)
 
-        # ── 4. UNet prediction: f_θ(x_t, t) ────────────────────────────
-        pred = self.unet(x_t, t, global_cond=global_cond)           # (B, T, D)
+        # ── 4. UNet prediction: v_θ(x_t, t) ≈ (x_0 - ε) ───────────────
+        pred_unscaled = self.unet(x_t, t, global_cond=global_cond)  # (B, T, D)
 
-        # ── 5. Score-matching loss ──────────────────────────────────────
-        score_loss = F.mse_loss(pred, target, reduction="none")      # (B, T, D)
+        # ── 5. Score-matching loss (weighted, gradient-stable) ──────────
+        score_loss = F.mse_loss(
+            pred_unscaled, target_unscaled, reduction="none"
+        )                                               # (B, T, D)
 
         # ── 6. Lyapunov regulariser (Theorem 1, Condition 1) ───────────
-        # R(θ) = ||f_θ||² - ||target||²  per time step
-        pred_sq   = (pred   ** 2).sum(dim=-1)           # (B, T)
-        target_sq = (target ** 2).sum(dim=-1)           # (B, T)
+        # Rescale both to drift units for a dimensionally correct residual:
+        #     R(θ) = ||f_θ||² - ||target||²
+        #          = ||v_θ / (1-t)||² - ||(x0-ε) / (1-t)||²
+        #          = (||v_θ||² - ||x0-ε||²) / (1-t)²
+        # The (1-t)² factor cancels in the hinge, so we compute in
+        # unscaled units and the relative overshoot is identical:
+        pred_sq   = (pred_unscaled   ** 2).sum(dim=-1)  # (B, T)
+        target_sq = (target_unscaled ** 2).sum(dim=-1)  # (B, T)
 
-        lyapunov_residual = pred_sq - target_sq         # (B, T)
-        lyapunov_reg = F.relu(lyapunov_residual).unsqueeze(-1)       # (B, T, 1)
+        lyapunov_residual = pred_sq - target_sq          # (B, T)
+        lyapunov_reg = F.relu(lyapunov_residual).unsqueeze(-1)        # (B, T, 1)
 
         # ── 7. Optional padding mask ────────────────────────────────────
         if cfg.do_mask_loss_for_padding:
