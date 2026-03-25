@@ -46,7 +46,7 @@ class FlowConfig(PreTrainedConfig):
     use_film_scale_modulation: bool = True
     
     # 新增 flow 特有的参数
-    num_flow_steps: int = 50  # 推理ODE步数
+    num_flow_steps: int = 10  # 推理ODE步数
     flow_sampling_method: str = "euler"  # euler / rk4
     flow_loss_type: str = "mse"  # velocity regression
     #flow_timestep_embed_dim: int = 128

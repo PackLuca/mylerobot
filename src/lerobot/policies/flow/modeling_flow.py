@@ -200,18 +200,13 @@ class FlowModel(nn.Module):
         for i in range(num_steps):
             # 当前时间点 t 属于 [0, 1)
             t_val = i / num_steps
-
-            # 将连续时间步 t ∈ [0,1) 映射到整数范围 [0, 1000)
-            # DiffusionSinusoidalPosEmb 期待整数输入；传入浮点 t≈0 时
-            # 所有频率分量 sin/cos ≈ 0，UNet 无法感知时间步信息。
-            t_embed = torch.full(
-                (batch_size,), int(t_val * 1000), dtype=torch.long, device=device
-            )
+            t = torch.full((batch_size,), t_val, device=device, dtype=dtype)
 
             # 预测当前位置的速度向量 (Velocity)
+            # 注意：这里的 self.unet 实际上扮演了 Vector Field 的角色
             v_t = self.unet(
                 x,
-                t_embed,
+                t,  # 传入连续的时间步
                 global_cond=global_cond,
             )
 
@@ -320,11 +315,8 @@ class FlowModel(nn.Module):
         v_t = x_1 - x_0
         
         # 4. 前向传播预测速度场
-        # 将连续时间步 t ∈ [0,1) 映射到整数范围 [0, 1000)
-        # DiffusionSinusoidalPosEmb 期待整数输入；传入浮点 t≈0 时
-        # 所有频率分量 sin/cos ≈ 0，UNet 无法感知时间步信息。
-        t_embed = (t * 1000).long()   # (B,) int in [0, 1000)
-        pred = self.unet(x_t, t_embed, global_cond=global_cond)
+        # 注意：原本的 Unet 期待整数 timestep，如果是浮点数 t，建议在传入前乘以 1000 或在 Unet 内部适配连续时间嵌入
+        pred = self.unet(x_t, t, global_cond=global_cond)
         
         # 5. 计算损失
         loss = F.mse_loss(pred, v_t, reduction="none")
