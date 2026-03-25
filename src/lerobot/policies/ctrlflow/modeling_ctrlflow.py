@@ -250,27 +250,31 @@ class CTRLFlowModel(nn.Module):
     ) -> Tensor:
         """Sample action trajectories via the CTRL-Flow reverse SDE.
 
-        Reverse SDE (paper Theorem 1, g = sqrt(2)·I):
-            dX = f_θ(X, t) dt  +  sqrt(2) dW̄_t
+        Reverse SDE with time-varying diffusion (consistent with straight-line path):
+            dX = f_θ(X, t) dt  +  g(t) dW̄_t
+
+        where g(t) = sde_noise_scale · sqrt(2) · (1 - t) decreases linearly
+        toward zero as t → 0, matching the straight-line path's variance
+        structure and ensuring zero noise injection at the data manifold.
 
         Euler-Maruyama update at step k (t decreasing from t_max to 0):
-            t_k     = t_max - k · Δt
-            x_{k+1} = x_k  +  Δt · f_θ(x_k, t_k)       ← drift
-                            +  sqrt(2·Δt) · ε_k           ← diffusion (g=√2)
+            t_k       = t_max - k · Δt
+            g_k       = sde_noise_scale · sqrt(2) · (1 - t_k)   ← time-varying
+            x_{k+1}   = x_k  +  Δt · f_θ(x_k, t_k)             ← drift
+                              +  g_k · sqrt(Δt) · ε_k            ← diffusion
             ε_k ~ N(0, I)
 
-        Diffusion is skipped on the final step (k = N-1, t_k → 0) to
-        avoid injecting noise when the sample is near the data manifold.
+        SNR(t) = sqrt(Δt) · ||v_θ|| / (sqrt(2) · (1-t)²)
+        As t → 0: SNR → ∞  (noise vanishes, trajectory stabilises)
+        As t → t_max: g ≈ sqrt(2) · t_min_gap  (small but nonzero)
 
-        Initial sample:
-            x ~ N(0, I)   [matches marginal of x_{t_max} when t_max ≈ 1
-                           and actions are normalised to zero mean, unit std]
+        Diffusion is always skipped on the final step (k = N-1).
 
         Args:
             batch_size: Number of action trajectories to generate.
             global_cond: (B, C) observation conditioning vector.
             generator: Optional torch.Generator for reproducibility.
-            noise: Optional pre-sampled initial x ~ N(0, I).
+            noise: Optional pre-sampled initial x.
 
         Returns:
             (B, horizon, action_dim) action trajectories.
@@ -281,9 +285,8 @@ class CTRLFlowModel(nn.Module):
 
         action_dim = cfg.action_feature.shape[0]
 
-        # ── Initial sample: x ~ N(0, I) ────────────────────────────────
-        # Matches the marginal of x_{t_max} = (1-t_max)·x_0 + t_max·ε
-        # ≈ ε when t_max ≈ 1 and x_0 is O(1).
+        # ── Initial sample ──────────────────────────────────────────────
+        # Marginal of x_{t_max} = (1-t_max)·x_0 + t_max·ε has std ≈ t_max.
         if noise is not None:
             x = noise
         else:
@@ -292,36 +295,35 @@ class CTRLFlowModel(nn.Module):
                 dtype=dtype, device=device, generator=generator,
             ) * cfg.t_max
 
-        dt       = cfg.dt                               # Δt = t_max / N
-        diff_std = cfg.g_coeff * math.sqrt(dt)          # sqrt(2·Δt)
+        dt = cfg.dt                                     # Δt = t_max / N
 
         # ── Euler-Maruyama loop: t_max → 0 ─────────────────────────────
         for k in range(cfg.num_sde_steps):
-            # Current pseudo-time (decreasing)
-            t_k = cfg.t_max - k * dt                    # scalar
+            t_k = cfg.t_max - k * dt                    # current t (decreasing)
 
-            # Batch timestep tensor for UNet conditioning
             t_batch = torch.full(
                 (batch_size,), t_k, dtype=dtype, device=device
-            )                                           # (B,)
+            )
 
-            # v_θ(x_k, t_k) ≈ (x_0 - ε)   [unscaled tangent, O(1)]
-            v = self.unet(x, t_batch, global_cond=global_cond)  # (B,T,D)
+            # v_θ(x_k, t_k) ≈ (x_0 - ε)   [unscaled, O(1)]
+            v = self.unet(x, t_batch, global_cond=global_cond)
 
-            # Recover drift: f_θ = v_θ / (1 - t_k)
-            # Clamp denominator to t_min_gap for numerical safety.
+            # Drift: f_θ = v_θ / (1 - t_k)
             one_minus_t_k = max(1.0 - t_k, cfg.t_min_gap)
-            drift = v / one_minus_t_k                        # (B,T,D)
+            drift = v / one_minus_t_k
 
-            # ── Drift step: Δt · f_θ ───────────────────────────────────
+            # ── Drift step ─────────────────────────────────────────────
             x = x + dt * drift
 
-            # ── Diffusion step: sqrt(2·Δt) · ε  (g = sqrt(2)·I) ───────
-            # Omit on the final step (trajectory has reached data manifold).
+            # ── Diffusion step with time-varying g(t) ──────────────────
+            # g(t_k) = sde_noise_scale · sqrt(2) · (1 - t_k)
+            # → g → 0 as t_k → 0, no noise injected near data manifold.
+            # → g ≈ sde_noise_scale·sqrt(2)·t_min_gap at t_k = t_max.
             is_last_step = (k == cfg.num_sde_steps - 1)
-            if not is_last_step and diff_std > 0.0:
-                eps = torch.randn_like(x, generator=generator)
-                x = x + diff_std * eps
+            if not is_last_step and cfg.sde_noise_scale > 0.0:
+                g_t    = cfg.sde_noise_scale * math.sqrt(2.0) * one_minus_t_k
+                diff_std = g_t * math.sqrt(dt)
+                x = x + diff_std * torch.randn_like(x, generator=generator)
 
         return x
 
