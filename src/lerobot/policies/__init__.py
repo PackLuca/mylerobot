@@ -27,7 +27,7 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 # Flow Matching 相关配置
 from .flow.configuration_flow import FlowConfig as FlowConfig
 #Ctrl-Flow 相关配置
-from .ctrlflow.configuration_ctrlflow import CTRLFlowConfig as CTRLFlowConfig
+#from .ctrlflow.configuration_ctrlflow import CTRLFlowConfig as CTRLFlowConfig
 
 
 __all__ = [
@@ -46,6 +46,6 @@ __all__ = [
     # Flow Matching 相关配置
     "FlowConfig",
     # Flow Matching 相关配置
-    "CTRLFlowConfig",
+    #"CTRLFlowConfig",
 
 ]
