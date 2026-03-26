@@ -22,7 +22,7 @@ from lerobot.policies.utils import (
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
-from mysde import VPSDE, SDEBase
+from lerobot.policies.ctrlflow.mysde import VPSDE, SDEBase
 
 
 class CtrlFlowPolicy(PreTrainedPolicy):
