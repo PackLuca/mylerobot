@@ -99,7 +99,7 @@ class SDEBase(ABC):
         else:
             t_val = t.float().to(sample.device)
 
-        dt = -1.0 / self.num_inference_steps
+        dt = torch.tensor(-1.0 / self.num_inference_steps, device=sample.device)
 
         beta = self._beta_t(t_val)
         alpha = self._alpha(t_val)
