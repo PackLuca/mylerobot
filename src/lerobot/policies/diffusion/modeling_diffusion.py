@@ -160,166 +160,8 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         return DDPMScheduler(**kwargs)
     elif name == "DDIM":
         return DDIMScheduler(**kwargs)
-    elif name == "SDE":
-        # VP-SDE does not use the diffusers scheduler; extract only the params it needs.
-        return VPSDEScheduler(
-            num_train_timesteps=kwargs.get("num_train_timesteps", 100),
-            beta_start=kwargs.get("beta_start", 0.0001),
-            beta_end=kwargs.get("beta_end", 0.02),
-            clip_sample=kwargs.get("clip_sample", True),
-            clip_sample_range=kwargs.get("clip_sample_range", 1.0),
-            prediction_type=kwargs.get("prediction_type", "epsilon"),
-        )
     else:
         raise ValueError(f"Unsupported noise scheduler type {name}")
-
-
-class VPSDEScheduler:
-    """Variance-Preserving SDE (VP-SDE) scheduler for continuous-time diffusion.
-
-    Forward process:  dx = -½ β(t) x dt + √β(t) dW
-    Marginal:         q(x_t | x_0) = N(x_t; α(t) x_0, σ²(t) I)
-      where  α(t) = exp(-½ ∫₀ᵗ β(s) ds),   σ²(t) = 1 - α²(t)
-
-    We use the linear-β schedule:  β(t) = β_min + t(β_max - β_min),  t ∈ [0, 1].
-
-    The class intentionally mirrors the minimal interface used by DiffusionModel so that
-    only the SDE-specific methods (add_noise / step / set_timesteps) differ.
-    """
-
-    def __init__(
-        self,
-        num_train_timesteps: int = 100,
-        beta_start: float = 0.0001,
-        beta_end: float = 0.02,
-        clip_sample: bool = True,
-        clip_sample_range: float = 1.0,
-        prediction_type: str = "epsilon",
-    ):
-        # Expose a .config namespace so existing code that reads
-        # self.noise_scheduler.config.num_train_timesteps keeps working.
-        class _Cfg:
-            pass
-
-        self.config = _Cfg()
-        self.config.num_train_timesteps = num_train_timesteps
-        self.config.prediction_type = prediction_type
-
-        self.beta_min = beta_start * num_train_timesteps  # rescale to continuous t ∈ [0,1]
-        self.beta_max = beta_end * num_train_timesteps
-        self.clip_sample = clip_sample
-        self.clip_sample_range = clip_sample_range
-        self.prediction_type = prediction_type
-        self.num_train_timesteps = num_train_timesteps
-
-        self.timesteps: Tensor | None = None  # set by set_timesteps()
-
-    # ------------------------------------------------------------------
-    # Helpers: marginal statistics at continuous time t ∈ [0, 1]
-    # ------------------------------------------------------------------
-    def _integral_beta(self, t: Tensor) -> Tensor:
-        """∫₀ᵗ β(s) ds  for linear schedule."""
-        return self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t**2
-
-    def _alpha(self, t: Tensor) -> Tensor:
-        """Mean coefficient α(t) = exp(-½ ∫₀ᵗ β(s) ds)."""
-        return torch.exp(-0.5 * self._integral_beta(t))
-
-    def _sigma(self, t: Tensor) -> Tensor:
-        """Std dev σ(t) = √(1 - α²(t))."""
-        return torch.sqrt(torch.clamp(1.0 - self._alpha(t) ** 2, min=1e-5))
-
-    def _beta_t(self, t: Tensor) -> Tensor:
-        """Instantaneous β(t) = β_min + t(β_max - β_min)."""
-        return self.beta_min + t * (self.beta_max - self.beta_min)
-
-    # ------------------------------------------------------------------
-    # Public API (mirrors DDPMScheduler interface used by DiffusionModel)
-    # ------------------------------------------------------------------
-    def set_timesteps(self, num_inference_steps: int) -> None:
-        """Set evenly-spaced continuous timesteps for reverse diffusion."""
-        # Descending from ~1 to ~0, stored as integer indices for API compatibility;
-        # internally we map them back to [0,1] in step().
-        self.num_inference_steps = num_inference_steps
-        # Store as float tensor in (0, 1] descending
-        self.timesteps = torch.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
-
-    def add_noise(self, x0: Tensor, noise: Tensor, timesteps: Tensor) -> Tensor:
-        """Forward diffusion: x_t = α(t) x_0 + σ(t) ε,  t ∈ [0,1].
-
-        `timesteps` here are *integer* indices in [0, num_train_timesteps) coming from
-        the training loop (matching the DDPMScheduler signature); we rescale to [0,1].
-        """
-        t = timesteps.float() / self.num_train_timesteps  # → [0, 1)
-        # Reshape for broadcasting: (B,) → (B, 1, 1)
-        while t.dim() < x0.dim():
-            t = t.unsqueeze(-1)
-        alpha = self._alpha(t)
-        sigma = self._sigma(t)
-        return alpha * x0 + sigma * noise
-
-    def step(
-        self,
-        model_output: Tensor,
-        t: Tensor | float,
-        sample: Tensor,
-        generator: torch.Generator | None = None,
-    ):
-        """One reverse-SDE step (Euler-Maruyama discretisation of the reverse VP-SDE).
-
-        Reverse SDE:  dx = [-½ β(t) x - β(t) ∇_x log p(x)] dt + √β(t) dW̄
-
-        With the score approximated from the U-Net prediction:
-            ∇_x log p ≈ -ε_θ / σ(t)    (for prediction_type="epsilon")
-            ∇_x log p ≈ -(x - α(t) x̂₀) / σ²(t)   (for prediction_type="sample")
-
-        Returns a namespace with `.prev_sample` to match the diffusers API.
-        """
-        # t may be a scalar float (from set_timesteps linspace) or a 0-d tensor.
-        if not isinstance(t, Tensor):
-            t_val = torch.tensor(t, dtype=torch.float32, device=sample.device)
-        else:
-            t_val = t.float().to(sample.device)
-
-        dt = -1.0 / self.num_inference_steps  # negative because we go t → t + dt (backwards)
-
-        beta = self._beta_t(t_val)
-        alpha = self._alpha(t_val)
-        sigma = self._sigma(t_val)
-
-        # Reshape scalar statistics to broadcast against sample shape (B, T, D).
-        while beta.dim() < sample.dim():
-            beta = beta.unsqueeze(-1)
-            alpha = alpha.unsqueeze(-1)
-            sigma = sigma.unsqueeze(-1)
-
-        # Recover score from network output.
-        if self.prediction_type == "epsilon":
-            # ε_θ ≈ noise;  score = -ε / σ
-            score = -model_output / sigma
-        elif self.prediction_type == "sample":
-            # x̂₀ predicted directly;  score = -(x - α x̂₀) / σ²
-            score = -(sample - alpha * model_output) / (sigma**2)
-        else:
-            raise ValueError(f"Unsupported prediction_type {self.prediction_type}")
-
-        # Deterministic (probability-flow ODE) drift + stochastic term.
-        # drift:  f(x,t) dt  where f = -½ β x - β score · σ²  (using score def above)
-        drift = (-0.5 * beta * sample - beta * score) * dt
-        diffusion_coeff = (beta * abs(dt)) ** 0.5  # √(β |dt|)
-
-        z = torch.randn(sample.shape, device=sample.device, generator=generator, dtype=sample.dtype)
-        prev_sample = sample + drift + diffusion_coeff * z
-
-        if self.clip_sample:
-            prev_sample = prev_sample.clamp(-self.clip_sample_range, self.clip_sample_range)
-
-        class _Out:
-            pass
-
-        out = _Out()
-        out.prev_sample = prev_sample
-        return out
 
 
 class DiffusionModel(nn.Module):
@@ -390,17 +232,10 @@ class DiffusionModel(nn.Module):
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
-            # For VP-SDE: t ∈ (0,1], scale back to [0, num_train_timesteps) to match the
-            # sinusoidal embedding's expected numeric range (same scale used in compute_loss).
-            # For DDPM/DDIM: t is already an integer index, pass as long.
-            if isinstance(self.noise_scheduler, VPSDEScheduler):
-                t_scaled = t.item() * self.noise_scheduler.num_train_timesteps
-                t_input = torch.full(sample.shape[:1], t_scaled, dtype=torch.float32, device=sample.device)
-            else:
-                t_input = torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device)
+            # Predict model output.
             model_output = self.unet(
                 sample,
-                t_input,
+                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                 global_cond=global_cond,
             )
             # Compute previous image: x_t -> x_t-1
@@ -512,15 +347,8 @@ class DiffusionModel(nn.Module):
         # Add noise to the clean trajectories according to the noise magnitude at each timestep.
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
-        # For VP-SDE, pass timesteps as float (same integer-scale values the sinusoidal embedding
-        # was designed for). For DDPM/DDIM, pass as long integers.
-        if isinstance(self.noise_scheduler, VPSDEScheduler):
-            unet_timesteps = timesteps.float()
-        else:
-            unet_timesteps = timesteps
-
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, unet_timesteps, global_cond=global_cond)
+        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
