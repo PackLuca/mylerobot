@@ -287,6 +287,12 @@ class VPSDEScheduler:
         alpha = self._alpha(t_val)
         sigma = self._sigma(t_val)
 
+        # Reshape scalar statistics to broadcast against sample shape (B, T, D).
+        while beta.dim() < sample.dim():
+            beta = beta.unsqueeze(-1)
+            alpha = alpha.unsqueeze(-1)
+            sigma = sigma.unsqueeze(-1)
+
         # Recover score from network output.
         if self.prediction_type == "epsilon":
             # ε_θ ≈ noise;  score = -ε / σ
@@ -384,10 +390,12 @@ class DiffusionModel(nn.Module):
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
-            # Predict model output.
-            # For VP-SDE the timestep is a continuous float in (0,1]; for DDPM/DDIM it is a long integer.
+            # For VP-SDE: t ∈ (0,1], scale back to [0, num_train_timesteps) to match the
+            # sinusoidal embedding's expected numeric range (same scale used in compute_loss).
+            # For DDPM/DDIM: t is already an integer index, pass as long.
             if isinstance(self.noise_scheduler, VPSDEScheduler):
-                t_input = torch.full(sample.shape[:1], t.item(), dtype=torch.float32, device=sample.device)
+                t_scaled = t.item() * self.noise_scheduler.num_train_timesteps
+                t_input = torch.full(sample.shape[:1], t_scaled, dtype=torch.float32, device=sample.device)
             else:
                 t_input = torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device)
             model_output = self.unet(
@@ -504,10 +512,10 @@ class DiffusionModel(nn.Module):
         # Add noise to the clean trajectories according to the noise magnitude at each timestep.
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
-        # For VP-SDE, convert integer indices to normalized continuous time t ∈ (0,1] for the U-Net.
-        # For DDPM/DDIM, pass the integer indices as-is.
+        # For VP-SDE, pass timesteps as float (same integer-scale values the sinusoidal embedding
+        # was designed for). For DDPM/DDIM, pass as long integers.
         if isinstance(self.noise_scheduler, VPSDEScheduler):
-            unet_timesteps = timesteps.float() / self.noise_scheduler.num_train_timesteps
+            unet_timesteps = timesteps.float()
         else:
             unet_timesteps = timesteps
 
