@@ -1,3 +1,20 @@
+#!/usr/bin/env python
+
+# Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
+# and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import math
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -8,9 +25,12 @@ from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
 @PreTrainedConfig.register_subclass("ctrlflow")
 @dataclass
-class DiffusionConfig(PreTrainedConfig):
+class CTRLFlowConfig(PreTrainedConfig):
+    
 
-    # Inputs / output structure.
+    # ------------------------------------------------------------------ #
+    # Inputs / outputs
+    # ------------------------------------------------------------------ #
     n_obs_steps: int = 2
     horizon: int = 16
     n_action_steps: int = 8
@@ -18,17 +38,15 @@ class DiffusionConfig(PreTrainedConfig):
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
-            "STATE": NormalizationMode.MIN_MAX,
+            "STATE":  NormalizationMode.MIN_MAX,
             "ACTION": NormalizationMode.MIN_MAX,
         }
     )
+    drop_n_last_frames: int = 7
 
-    # The original implementation doesn't sample frames for the last 7 steps,
-    # which avoids excessive padding and leads to improved training results.
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
-
-    # Architecture / modeling.
-    # Vision backbone.
+    # ------------------------------------------------------------------ #
+    # Vision encoder
+    # ------------------------------------------------------------------ #
     vision_backbone: str = "resnet18"
     resize_shape: tuple[int, int] | None = None
     crop_ratio: float = 1.0
@@ -38,33 +56,46 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
-    # Unet.
+
+    # ------------------------------------------------------------------ #
+    # UNet
+    # ------------------------------------------------------------------ #
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
-    # Noise scheduler.
-    noise_scheduler_type: str = "DDPM"
-    num_train_timesteps: int = 100
-    beta_schedule: str = "squaredcos_cap_v2"
-    beta_start: float = 0.0001
-    beta_end: float = 0.02
-    prediction_type: str = "epsilon"
-    clip_sample: bool = True
-    clip_sample_range: float = 1.0
 
-    # Inference
-    num_inference_steps: int | None = None
+    # ------------------------------------------------------------------ #
+    # CTRL-Flow time schedule
+    # t ∈ [0, t_max],  t_max = 1 - t_min_gap
+    # Δt = t_max / num_sde_steps
+    # ------------------------------------------------------------------ #
+    t_min_gap: float = 0.01     # t_max = 1 - t_min_gap; bounds 1/(1-t)
+    num_sde_steps: int = 10     # Euler-Maruyama steps at inference
 
-    # Optimization
+    # ------------------------------------------------------------------ #
+    # CTRL-Flow SDE diffusion  (paper: g = sqrt(2)·I)
+    # g_eff = sde_noise_scale * sqrt(2) · I
+    # ------------------------------------------------------------------ #
+    sde_noise_scale: float = 1.0
+
+    # ------------------------------------------------------------------ #
+    # Training loss
+    # ------------------------------------------------------------------ #
+    score_loss_weight: float = 1.0
+    lyapunov_lambda: float = 0.1
+
+    # ------------------------------------------------------------------ #
+    # Misc
+    # ------------------------------------------------------------------ #
+    do_mask_loss_for_padding: bool = False
     compile_model: bool = False
     compile_mode: str = "reduce-overhead"
 
-    # Loss computation
-    do_mask_loss_for_padding: bool = False
-
-    # Training presets
+    # ------------------------------------------------------------------ #
+    # Optimisation
+    # ------------------------------------------------------------------ #
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
@@ -72,54 +103,76 @@ class DiffusionConfig(PreTrainedConfig):
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
+    # ------------------------------------------------------------------ #
     def __post_init__(self):
         super().__post_init__()
 
-        """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"`vision_backbone` must be a ResNet variant. Got {self.vision_backbone}."
             )
-
-        supported_prediction_types = ["epsilon", "sample"]
-        if self.prediction_type not in supported_prediction_types:
-            raise ValueError(
-                f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
-            )
-        supported_noise_schedulers = ["DDPM", "DDIM"]
-        if self.noise_scheduler_type not in supported_noise_schedulers:
-            raise ValueError(
-                f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
-                f"Got {self.noise_scheduler_type}."
-            )
-
-        if self.resize_shape is not None and (
-            len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
-        ):
-            raise ValueError(f"`resize_shape` must be a pair of positive integers. Got {self.resize_shape}.")
-        if not (0 < self.crop_ratio <= 1.0):
-            raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
+        if not (0.0 < self.t_min_gap < 1.0):
+            raise ValueError(f"`t_min_gap` must be in (0, 1). Got {self.t_min_gap}.")
+        if self.num_sde_steps < 1:
+            raise ValueError(f"`num_sde_steps` must be >= 1. Got {self.num_sde_steps}.")
+        if self.sde_noise_scale < 0.0:
+            raise ValueError(f"`sde_noise_scale` must be >= 0. Got {self.sde_noise_scale}.")
+        if self.lyapunov_lambda < 0.0:
+            raise ValueError(f"`lyapunov_lambda` must be >= 0. Got {self.lyapunov_lambda}.")
+        if self.score_loss_weight <= 0.0:
+            raise ValueError(f"`score_loss_weight` must be > 0. Got {self.score_loss_weight}.")
 
         if self.resize_shape is not None:
+            if len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape):
+                raise ValueError(
+                    f"`resize_shape` must be two positive ints. Got {self.resize_shape}."
+                )
             if self.crop_ratio < 1.0:
                 self.crop_shape = (
                     int(self.resize_shape[0] * self.crop_ratio),
                     int(self.resize_shape[1] * self.crop_ratio),
                 )
-            else:
-                # Explicitly disable cropping for resize+ratio path when crop_ratio == 1.0.
-                self.crop_shape = None
-        if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
-            raise ValueError(f"`crop_shape` must have positive dimensions. Got {self.crop_shape}.")
 
-        # Check that the horizon size and U-Net downsampling is compatible.
-        # U-Net downsamples by 2 with each stage.
+        if not (0 < self.crop_ratio <= 1.0):
+            raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
+
+        if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
+            raise ValueError(f"`crop_shape` must have positive dims. Got {self.crop_shape}.")
+
         downsampling_factor = 2 ** len(self.down_dims)
         if self.horizon % downsampling_factor != 0:
             raise ValueError(
-                "The horizon should be an integer multiple of the downsampling factor (which is determined "
-                f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
+                f"horizon must be divisible by 2**len(down_dims)={downsampling_factor}. "
+                f"Got {self.horizon=} and {self.down_dims=}."
             )
+
+    # ------------------------------------------------------------------ #
+    # Derived quantities
+    # ------------------------------------------------------------------ #
+
+    @property
+    def t_max(self) -> float:
+        """Upper integration bound: t_max = 1 - t_min_gap < 1.
+        Prevents target = (x0 - eps)/(1-t) from diverging.
+        """
+        return 1.0 - self.t_min_gap
+
+    @property
+    def dt(self) -> float:
+        """Euler-Maruyama step size: Δt = t_max / num_sde_steps."""
+        return self.t_max / self.num_sde_steps
+
+    @property
+    def g_coeff(self) -> float:
+        """Effective diffusion magnitude: sde_noise_scale * sqrt(2).
+        Paper design: sde_noise_scale=1 → g_coeff = sqrt(2).
+        Diffusion std per EM step: g_coeff * sqrt(Δt).
+        """
+        return self.sde_noise_scale * math.sqrt(2.0)
+
+    # ------------------------------------------------------------------ #
+    # LeRobot hooks
+    # ------------------------------------------------------------------ #
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(
@@ -137,23 +190,26 @@ class DiffusionConfig(PreTrainedConfig):
 
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
-
+            raise ValueError(
+                "Provide at least one image or the environment state as input."
+            )
         if self.resize_shape is None and self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
-                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
+                if (
+                    self.crop_shape[0] > image_ft.shape[1]
+                    or self.crop_shape[1] > image_ft.shape[2]
+                ):
                     raise ValueError(
-                        f"`crop_shape` should fit within the image shapes. Got {self.crop_shape} "
-                        f"for `crop_shape` and {image_ft.shape} for `{key}`."
+                        f"`crop_shape` {self.crop_shape} exceeds image shape "
+                        f"{image_ft.shape} for key `{key}`."
                     )
-
-        # Check that all input images have the same shape.
         if len(self.image_features) > 0:
-            first_image_key, first_image_ft = next(iter(self.image_features.items()))
-            for key, image_ft in self.image_features.items():
-                if image_ft.shape != first_image_ft.shape:
+            first_key, first_ft = next(iter(self.image_features.items()))
+            for key, ft in self.image_features.items():
+                if ft.shape != first_ft.shape:
                     raise ValueError(
-                        f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
+                        f"Image shape mismatch: `{key}` {ft.shape} != "
+                        f"`{first_key}` {first_ft.shape}."
                     )
 
     @property

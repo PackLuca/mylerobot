@@ -14,6 +14,9 @@
 
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+
+from .diffusion1.configuration_diffusion1 import DiffusionConfig as DiffusionConfig1
+
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
@@ -47,5 +50,6 @@ __all__ = [
     "FlowConfig",
     # Flow Matching 相关配置
     #"CTRLFlowConfig",
+    "DiffusionConfig1",
 
 ]
