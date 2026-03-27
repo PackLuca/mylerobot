@@ -295,7 +295,10 @@ class CtrlFlowModel(nn.Module):
             target = batch[ACTION]
         elif self.config.prediction_type == "score":
             t = timesteps.float() / self.sde.num_train_timesteps
-            sigma = self.sde._sigma(t)
+            sigma = self.sde._sigma(t)  # (B,)
+            # 广播到 (B, T, D) 与 eps 对齐
+            while sigma.dim() < eps.dim():
+                sigma = sigma.unsqueeze(-1)
             target = -eps / sigma
         else:
             raise ValueError(f"不支持的prediction type: {self.config.prediction_type}")

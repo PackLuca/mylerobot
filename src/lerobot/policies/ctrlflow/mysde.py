@@ -193,8 +193,13 @@ class VPSDE(SDEBase):
     def _reverse_drift(
         self, x: Tensor, beta: Tensor, score: Tensor, alpha: Tensor, sigma: Tensor
     ) -> Tensor:
-        """逆向漂移: f(x,t) = -½ β x - β score · σ²"""
-        return -0.5 * beta * x - beta * score * (sigma**2)
+        """逆向漂移: f̃(x,t) = -½ β x - β · score
+        
+        逆向SDE公式: f̃ = f(x,t) - g²(t)·s_θ，VP-SDE中 g²(t)=β(t)。
+        score 已是 ∇_x log p，量纲正确，不应再乘 σ²。
+        """
+        # score 此处已是 ∇_x log p，g²(t) = β(t)，不再乘 σ²
+        return -0.5 * beta * x - beta * score
 
     def _diffusion_coeff(self, beta: Tensor, dt: Tensor) -> Tensor:
         """扩散系数: g(t) = √(β |dt|)"""
