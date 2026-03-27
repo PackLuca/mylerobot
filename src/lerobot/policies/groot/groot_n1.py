@@ -189,15 +189,25 @@ N_COLOR_CHANNELS = 3
     #     super().__init__(**kwargs)
     #     for key, value in kwargs.items():
     #         setattr(self, key, value)
-#报错修复
-@dataclass
+#报错修复：去掉 @dataclass，使用标准 PretrainedConfig 写法
 class GR00TN15Config(PretrainedConfig):
-    model_type: str = "gr00t_n1_5"
-    backbone_cfg: dict = field(default_factory=dict)
-    action_head_cfg: dict = field(default_factory=dict)
-    action_horizon: int = 0
-    action_dim: int = 0
-    compute_dtype: str = "float32"
+    model_type = "gr00t_n1_5"
+
+    def __init__(
+        self,
+        backbone_cfg: dict = None,
+        action_head_cfg: dict = None,
+        action_horizon: int = 0,
+        action_dim: int = 0,
+        compute_dtype: str = "float32",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.backbone_cfg = backbone_cfg if backbone_cfg is not None else {}
+        self.action_head_cfg = action_head_cfg if action_head_cfg is not None else {}
+        self.action_horizon = action_horizon
+        self.action_dim = action_dim
+        self.compute_dtype = compute_dtype
 
 # real model
 class GR00TN15(PreTrainedModel):
