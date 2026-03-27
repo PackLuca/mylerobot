@@ -184,11 +184,11 @@ class GR00TN15Config(PretrainedConfig):
 
     action_dim: int = field(init=False, metadata={"help": "Action dimension."})
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+#报错修复
+    # def __init__(self, **kwargs):
+    #     super().__init__(**kwargs)
+    #     for key, value in kwargs.items():
+    #         setattr(self, key, value)
 
 
 # real model
