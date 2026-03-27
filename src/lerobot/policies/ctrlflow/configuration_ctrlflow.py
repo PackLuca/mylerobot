@@ -58,13 +58,18 @@ class CtrlFlowConfig(PreTrainedConfig):
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
     # SDE.
-    sde_type: str = "VP-SDE"
+    sde_type: str = "DS-SDE" #VP-SDE or DS-SDE
     num_train_timesteps: int = 100
     beta_start: float = 0.0001
     beta_end: float = 0.02
     prediction_type: str = "epsilon"
     clip_sample: bool = True
     clip_sample_range: float = 1.0
+    # DS-SDE 专属超参（仅 sde_type="DS-SDE" 时生效）
+    ds_gamma_min: float = 0.5
+    ds_gamma_max: float = 3.0
+    ds_g_min: float = 0.01
+    ds_g_max: float = 1.0
 
     # Inference
     num_inference_steps: int | None = None
@@ -98,7 +103,7 @@ class CtrlFlowConfig(PreTrainedConfig):
             raise ValueError(
                 f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
             )
-        supported_sde_types = ["VP-SDE"]
+        supported_sde_types = ["VP-SDE", "DS-SDE"]
         if self.sde_type not in supported_sde_types:
             raise ValueError(
                 f"`sde_type` must be one of {supported_sde_types}. Got {self.sde_type}."

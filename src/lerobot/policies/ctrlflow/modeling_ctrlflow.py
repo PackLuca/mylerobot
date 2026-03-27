@@ -21,8 +21,7 @@ from lerobot.policies.utils import (
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-
-from lerobot.policies.ctrlflow.mysde import VPSDE, SDEBase
+from lerobot.policies.ctrlflow.mysde import VPSDE, DSSDE, SDEBase
 
 
 class CtrlFlowPolicy(PreTrainedPolicy):
@@ -121,6 +120,17 @@ def _make_sde(sde_type: str, **kwargs) -> SDEBase:
             clip_sample_range=kwargs.get("clip_sample_range", 1.0),
             prediction_type=kwargs.get("prediction_type", "epsilon"),
         )
+    elif sde_type == "DS-SDE":
+        return DSSDE(
+            num_train_timesteps=kwargs.get("num_train_timesteps", 100),
+            gamma_min=kwargs.get("ds_gamma_min", 0.5),
+            gamma_max=kwargs.get("ds_gamma_max", 3.0),
+            g_min=kwargs.get("ds_g_min", 0.01),
+            g_max=kwargs.get("ds_g_max", 1.0),
+            clip_sample=kwargs.get("clip_sample", True),
+            clip_sample_range=kwargs.get("clip_sample_range", 1.0),
+            prediction_type=kwargs.get("prediction_type", "epsilon"),
+        )
     else:
         raise ValueError(f"不支持的SDE类型: {sde_type}")
 
@@ -158,6 +168,10 @@ class CtrlFlowModel(nn.Module):
             clip_sample=config.clip_sample,
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
+            ds_gamma_min=config.ds_gamma_min,
+            ds_gamma_max=config.ds_gamma_max,
+            ds_g_min=config.ds_g_min,
+            ds_g_max=config.ds_g_max,
         )
 
         if config.num_inference_steps is None:
