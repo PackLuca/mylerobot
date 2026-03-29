@@ -21,7 +21,9 @@ from lerobot.policies.utils import (
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
+
 from lerobot.policies.ctrlflow.mysde import VPSDE, DSSDE, SDEBase
+from lerobot.policies.ctrlflow.myode import MMDODE
 
 
 class CtrlFlowPolicy(PreTrainedPolicy):
@@ -110,7 +112,7 @@ class CtrlFlowPolicy(PreTrainedPolicy):
 
 
 def _make_sde(sde_type: str, **kwargs) -> SDEBase:
-    """SDE工厂函数"""
+    """SDE/ODE工厂函数"""
     if sde_type == "VP-SDE":
         return VPSDE(
             num_train_timesteps=kwargs.get("num_train_timesteps", 100),
@@ -130,6 +132,15 @@ def _make_sde(sde_type: str, **kwargs) -> SDEBase:
             clip_sample=kwargs.get("clip_sample", True),
             clip_sample_range=kwargs.get("clip_sample_range", 1.0),
             prediction_type=kwargs.get("prediction_type", "epsilon"),
+        )
+    elif sde_type == "MMD-ODE":
+        return MMDODE(
+            num_train_timesteps=kwargs.get("num_train_timesteps", 100),
+            bandwidth=kwargs.get("mmd_bandwidth", 1.0),
+            clip_sample=kwargs.get("clip_sample", True),
+            clip_sample_range=kwargs.get("clip_sample_range", 1.0),
+            mmd_reg_weight=kwargs.get("mmd_reg_weight", 0.1),
+            bandwidth_auto=kwargs.get("mmd_bandwidth_auto", True),
         )
     else:
         raise ValueError(f"不支持的SDE类型: {sde_type}")
@@ -172,6 +183,9 @@ class CtrlFlowModel(nn.Module):
             ds_gamma_max=config.ds_gamma_max,
             ds_g_min=config.ds_g_min,
             ds_g_max=config.ds_g_max,
+            mmd_bandwidth=config.mmd_bandwidth,
+            mmd_reg_weight=config.mmd_reg_weight,
+            mmd_bandwidth_auto=config.mmd_bandwidth_auto,
         )
 
         if config.num_inference_steps is None:
@@ -302,6 +316,15 @@ class CtrlFlowModel(nn.Module):
         unet_timesteps = timesteps.float()
 
         pred = self.unet(noisy_trajectory, unet_timesteps, global_cond=global_cond)
+
+        # MMD-ODE: 直接委托给 MMDODE.compute_loss，包含 flow loss + MMD 正则
+        if isinstance(self.sde, MMDODE):
+            return self.sde.compute_loss(
+                pred_velocity=pred,
+                x0=trajectory,
+                noise=eps,
+                x_t=noisy_trajectory,
+            )
 
         if self.config.prediction_type == "epsilon":
             target = eps

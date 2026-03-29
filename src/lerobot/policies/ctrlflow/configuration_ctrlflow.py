@@ -58,7 +58,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
     # SDE.
-    sde_type: str = "DS-SDE" #VP-SDE or DS-SDE
+    sde_type: str = "VP-SDE"
     num_train_timesteps: int = 100
     beta_start: float = 0.0001
     beta_end: float = 0.02
@@ -70,6 +70,10 @@ class CtrlFlowConfig(PreTrainedConfig):
     ds_gamma_max: float = 3.0
     ds_g_min: float = 0.01
     ds_g_max: float = 1.0
+    # MMD-ODE 专属超参（仅 sde_type="MMD-ODE" 时生效）
+    mmd_bandwidth: float = 1.0
+    mmd_reg_weight: float = 0.1
+    mmd_bandwidth_auto: bool = True
 
     # Inference
     num_inference_steps: int | None = None
@@ -103,7 +107,7 @@ class CtrlFlowConfig(PreTrainedConfig):
             raise ValueError(
                 f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
             )
-        supported_sde_types = ["VP-SDE", "DS-SDE"]
+        supported_sde_types = ["VP-SDE", "DS-SDE", "MMD-ODE"]
         if self.sde_type not in supported_sde_types:
             raise ValueError(
                 f"`sde_type` must be one of {supported_sde_types}. Got {self.sde_type}."
