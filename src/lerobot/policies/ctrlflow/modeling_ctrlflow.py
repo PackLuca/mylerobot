@@ -173,9 +173,6 @@ class CtrlFlowModel(nn.Module):
             ds_gamma_max=config.ds_gamma_max,
             ds_g_min=config.ds_g_min,
             ds_g_max=config.ds_g_max,
-            mmd_bandwidth=config.mmd_bandwidth,
-            mmd_reg_weight=config.mmd_reg_weight,
-            mmd_bandwidth_auto=config.mmd_bandwidth_auto,
         )
 
         if config.num_inference_steps is None:
