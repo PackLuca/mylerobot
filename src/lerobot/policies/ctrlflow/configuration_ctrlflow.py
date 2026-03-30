@@ -58,7 +58,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
     # SDE.
-    sde_type: str = "VP-SDE"
+    sde_type: str = "MMD-ODE"
     num_train_timesteps: int = 100
     beta_start: float = 0.0001
     beta_end: float = 0.02
@@ -72,7 +72,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     ds_g_max: float = 1.0
     # MMD-ODE 专属超参（仅 sde_type="MMD-ODE" 时生效）
     mmd_bandwidth: float = 1.0
-    mmd_reg_weight: float = 0.1
+    mmd_reg_weight: float = 0
     mmd_bandwidth_auto: bool = True
 
     # Inference

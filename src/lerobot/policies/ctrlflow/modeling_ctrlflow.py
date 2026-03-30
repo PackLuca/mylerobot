@@ -293,6 +293,10 @@ class CtrlFlowModel(nn.Module):
 
         return actions
 
+    """
+    TODO 把 loss 计算下沉到各类型内部（像 MMDODE.compute_loss 那样），让 compute_loss 统一调用
+         self.sde.compute_loss(...)，彻底消除 isinstance 判断。
+    """
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
         assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
@@ -318,6 +322,7 @@ class CtrlFlowModel(nn.Module):
         pred = self.unet(noisy_trajectory, unet_timesteps, global_cond=global_cond)
 
         # MMD-ODE: 直接委托给 MMDODE.compute_loss，包含 flow loss + MMD 正则
+        # do_mask_loss_for_padding=True 不可用
         if isinstance(self.sde, MMDODE):
             return self.sde.compute_loss(
                 pred_velocity=pred,
