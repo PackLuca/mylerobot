@@ -57,7 +57,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
-    # SDE.
+    # SDE/ODE 类型选择.
     sde_type: str = "DS-SDE"
     num_train_timesteps: int = 100
     beta_start: float = 0.0001
@@ -70,6 +70,12 @@ class CtrlFlowConfig(PreTrainedConfig):
     ds_gamma_max: float = 3.0
     ds_g_min: float = 0.01
     ds_g_max: float = 1.0
+    # W2-ODE 专属超参（仅 sde_type="W2-ODE" 时生效）
+    w2_path_type: str = "linear"           # linear / cosine / sqrt / poly
+    w2_path_poly_order: float = 2.0        # poly 路径阶数 p
+    w2_lyapunov_reg_weight: float = 0.0    # §7.1 Lyapunov 正则项权重（0 → 纯速度场监督）
+    w2_inference_noise_scale: float = 0.0  # §5.2.1 推理扩散项强度 β（0 → 纯 ODE）
+    w2_sampling_method: str = "euler"      # euler / rk4
 
     # Inference
     num_inference_steps: int | None = None
@@ -103,11 +109,38 @@ class CtrlFlowConfig(PreTrainedConfig):
             raise ValueError(
                 f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
             )
-        supported_sde_types = ["VP-SDE", "DS-SDE"]
+
+        supported_sde_types = ["VP-SDE", "DS-SDE", "W2-ODE"]
         if self.sde_type not in supported_sde_types:
             raise ValueError(
                 f"`sde_type` must be one of {supported_sde_types}. Got {self.sde_type}."
             )
+
+        # W2-ODE 专属参数校验
+        if self.sde_type == "W2-ODE":
+            supported_path_types = ["linear", "cosine", "sqrt", "poly"]
+            if self.w2_path_type not in supported_path_types:
+                raise ValueError(
+                    f"`w2_path_type` must be one of {supported_path_types}. Got {self.w2_path_type}."
+                )
+            supported_sampling_methods = ["euler", "rk4"]
+            if self.w2_sampling_method not in supported_sampling_methods:
+                raise ValueError(
+                    f"`w2_sampling_method` must be one of {supported_sampling_methods}. "
+                    f"Got {self.w2_sampling_method}."
+                )
+            if self.w2_path_poly_order <= 0:
+                raise ValueError(
+                    f"`w2_path_poly_order` must be positive. Got {self.w2_path_poly_order}."
+                )
+            if self.w2_lyapunov_reg_weight < 0:
+                raise ValueError(
+                    f"`w2_lyapunov_reg_weight` must be >= 0. Got {self.w2_lyapunov_reg_weight}."
+                )
+            if self.w2_inference_noise_scale < 0:
+                raise ValueError(
+                    f"`w2_inference_noise_scale` must be >= 0. Got {self.w2_inference_noise_scale}."
+                )
 
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
