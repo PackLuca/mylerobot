@@ -1,70 +1,59 @@
 """纯 MMD 自然梯度流 ODE（CTRL-Flow 框架 §5.2.2）
 
 ===========================================================================
-理论来源：CTRL-Flow 论文 §5.2.2 + Proposition 2 + Table 1
+【时间方向约定——与 modeling_ctrlflow.py 对齐】
 ===========================================================================
 
-【核心设计：witness function + autograd，而非手推解析梯度】
+modeling_ctrlflow.py 的 conditional_sample() 逻辑：
+  - 起点 sample = randn(...)              ← 纯噪声
+  - timesteps = linspace(1.0, 1/N, N)    ← t 从大到小（1 → 0）
+  - 每步 step(model_output, t, sample)   ← t 大时是噪声态，t 小时是数据态
 
-  §5.2.2 的实现路径（论文隐含）：
+因此 modeling_ctrlflow.py 隐含的时间约定是：
+  t=1 → 噪声（x_noise），t≈0 → 数据（x_data）
 
-    Step 1. 用 batch 内样本估计 witness function ĥ_t(x)（U-统计量）：
-                ĥ_t(x) = (1/N) Σ_j k(x, x_j^{(t)}) - (1/M) Σ_j k(x, y_j)
-            其中 x_j^{(t)} ~ p_t（batch 内 x_t），y_j ~ p_data（batch 内 x0）
+本文件的所有实现必须与此对齐：
 
-    Step 2. 对 x_t 做 autograd，得到 ∇_x ĥ_t(x_t)：
-                torch.autograd.grad(ĥ_t(x_t).sum(), x_t)
+  前向过程 add_noise：
+    x_t = (1-t)·x_data + t·noise       ← t=1 时为噪声，t=0 时为数据 ✓
 
-    Step 3. 自然梯度流速度场（欧氏近似 G=I）：
-                v*(x_i, t) = -∇_{x_i} ĥ_t(x_i)
+  速度场方向（v 应把 x_t 从噪声推向数据，即 t 减小方向）：
+    v*(x, t) = -∇_x ĥ_t(x)
+    其中 ĥ_t(x) = E_{X~p_t}[k(x,X)] - E_{Y~p_data}[k(x,Y)]
 
-    Step 4. U-Net 学习 v_θ ≈ v*，loss = MSE(v_θ, v*)
+    当 x_t 接近噪声（t≈1）时，ĥ_t(x) > 0（p_t 偏向噪声，远离 p_data），
+    ∇_x ĥ_t 指向"更像 p_t"的方向，取负则指向"更像 p_data"的方向 ✓
 
-  为什么用 autograd 而非手推解析梯度？
+  推理步进 step（dt < 0，t 从 1 减小到 0）：
+    x_{t+dt} = x_t + v_θ(x_t, t) · dt
+    dt = -1/N < 0，sample 从噪声逐步变为数据 ✓
 
-    ① 灵活性：换核函数（如 Matérn、多项式、混合核）只改 _kernel()，
-              梯度计算无需改动，解析版则需重推每个核的 ∇_x k
-    ② 一致性：论文§5.2.2 提到 "natural-gradient preconditioning"，
-              未来扩展 G(p_t) ≠ I 时，autograd 可无缝支持
-    ③ 可读性：_witness_function() 直接对应论文公式，代码即文档
-    ④ 数值稳定：由 PyTorch 统一管理，避免手动 clamp 引入的不一致
+===========================================================================
+【target 量级归一化——解决训练信号爆炸问题】
+===========================================================================
 
-  数学等价性（对 RBF 核）：
-    autograd 结果与手推解析梯度完全等价：
-        ∇_{x_i} k(x_i, y_j) = k(x_i,y_j) · (y_j - x_i) / h²
-    但 autograd 方案无需硬编码此公式，更易维护和扩展。
+∇_x ĥ_t(x_i) ≈ (1/N) Σ_j k(x_i,x_j) · (x_j - x_i) / h²
 
-【Lyapunov 稳定性保证（Proposition 2）】
+当带宽 h 较小时（如 h=0.1），梯度量级 ∝ 1/h²=100，远超
+Flow Matching target（x_data - x_noise，量级 O(1)），导致 loss 爆炸。
 
-  选 L = MMD²(p_t, p_data) 为 Lyapunov 泛函，
-  令 v = -∇_x ĥ_t（即 -∇_{W2} L），则：
-      d/dt L(p_t) = ∫ <v, ∇_x δL/δρ> p_t dx
-                  = -∫ ‖∇_x ĥ_t‖² p_t dx
-                  = -‖∇_{W2} L‖²_{L²(p_t)}
-                  ≤ -2κ L(p_t)     （κ-测地凸性）
-  → L(p_t) ≤ e^{-2κt} L(p_0)，指数收敛。
+修复方案：对 target 做 L2 归一化后乘以参考量级：
+    target_norm = target / (‖target‖ + ε)   ← 单位方向
+    target_scaled = target_norm · ref_scale  ← 恢复合理量级
 
+ref_scale 默认取 1.0（与 Flow Matching 的 target 量级对齐），
+可通过 target_scale 参数调整。
+
+===========================================================================
 【与 modeling_ctrlflow.py 的接口】
-
+===========================================================================
   完全兼容，无需修改上层代码：
-  - add_noise(x0, noise, timesteps) → 线性插值构造 x_t（前向过程）
-  - step(model_output, t, sample)  → Euler ODE 推进（逆向过程）
-  - set_timesteps(N)               → 推理步数设置
-  - compute_loss(pred, x0, noise, x_t) → 主 loss + 可选 Lyapunov 正则
-  - prediction_type = "velocity"   → modeling_ctrlflow.py 的 isinstance 分支识别
+  - add_noise(x0, noise, timesteps) → x_t = (1-t)·x0 + t·noise（t=1 为噪声）
+  - set_timesteps(N)               → timesteps = linspace(1, 1/N, N)（从大到小）
+  - step(model_output, t, sample)  → Euler 步，dt < 0，t 从 1→0
+  - compute_loss(pred, x0, noise, x_t) → MMD 梯度监督 + 可选 Lyapunov 正则
+  - prediction_type = "velocity"   → isinstance(self.sde, MMDODE) 分支识别
   - self.config.num_train_timesteps → 属性兼容
-
-【与旧版 myode.py 的对比】
-
-  ┌────────────────────┬──────────────────────┬────────────────────────────┐
-  │                    │ 旧 myode.py          │ 本版本                     │
-  ├────────────────────┼──────────────────────┼────────────────────────────┤
-  │ 训练 target        │ x0 - noise (FM速度)  │ -∇_x ĥ_t(x_t) via autograd│
-  │ ∇_x ĥ_t 计算      │ 不计算               │ witness fn + autograd      │
-  │ 核函数扩展性       │ N/A                  │ 只改 _kernel() 即可        │
-  │ MMD 作用           │ 可选正则项           │ Lyapunov 泛函，驱动 target │
-  │ 论文对应           │ FM + MMD 混合        │ 纯 §5.2.2 自然梯度流       │
-  └────────────────────┴──────────────────────┴────────────────────────────┘
 """
 
 import math
@@ -90,10 +79,10 @@ class ODEResult:
 # ---------------------------------------------------------------------------
 
 def _kernel(x: Tensor, y: Tensor, bandwidth: float) -> Tensor:
-    """RBF（高斯）核 k(x, y) = exp(-‖x-y‖² / (2h²))
+    """RBF 核 k(x,y) = exp(-‖x-y‖² / (2h²))
 
-    替换说明：若要换核函数（Matérn、多项式等），只修改此函数即可，
-    梯度计算（_witness_grad）无需改动，因为它依赖 autograd。
+    只需修改此函数即可切换核类型（Matérn、多项式等），
+    梯度计算 _witness_grad 依赖 autograd，无需改动。
 
     参数:
         x: (N, D)
@@ -102,8 +91,8 @@ def _kernel(x: Tensor, y: Tensor, bandwidth: float) -> Tensor:
     返回:
         K: (N, M)
     """
-    x_sq = (x ** 2).sum(dim=-1, keepdim=True)    # (N, 1)
-    y_sq = (y ** 2).sum(dim=-1, keepdim=True)    # (M, 1)
+    x_sq  = (x ** 2).sum(dim=-1, keepdim=True)   # (N, 1)
+    y_sq  = (y ** 2).sum(dim=-1, keepdim=True)   # (M, 1)
     cross = x @ y.t()                             # (N, M)
     dist_sq = (x_sq + y_sq.t() - 2.0 * cross).clamp(min=0.0)
     return torch.exp(-dist_sq / (2.0 * bandwidth ** 2))
@@ -113,32 +102,28 @@ def _kernel(x: Tensor, y: Tensor, bandwidth: float) -> Tensor:
 # Witness function 及其梯度（autograd 方案）
 # ---------------------------------------------------------------------------
 
-def _witness_function(x: Tensor, x_t: Tensor, x0: Tensor, bandwidth: float) -> Tensor:
-    """估计 MMD witness function ĥ_t(x)（U-统计量）
+def _witness_function(
+    x: Tensor,
+    x_t: Tensor,
+    x_data: Tensor,
+    bandwidth: float,
+) -> Tensor:
+    """估计 MMD witness function ĥ_t(x)
 
-    ĥ_t(x) = E_{X~p_t}[k(x, X)] - E_{Y~p_data}[k(x, Y)]
+    ĥ_t(x) = E_{X~p_t}[k(x,X)] - E_{Y~p_data}[k(x,Y)]
             ≈ (1/N) Σ_j k(x, x_j^{(t)}) - (1/M) Σ_j k(x, y_j)
 
-    其中 x_j^{(t)} 用 batch 内 x_t 近似 p_t，
-         y_j       用 batch 内 x0 近似 p_data。
-
     参数:
-        x:    查询点 (N, D)，需 requires_grad=True 供 autograd 使用
-        x_t:  p_t 的样本 (N, D)，detach（不参与梯度）
-        x0:   p_data 的样本 (N, D)，detach（不参与梯度）
+        x:      查询点 (N, D)，需 requires_grad=True
+        x_t:    p_t 的样本 (N, D)，在函数内部 detach
+        x_data: p_data 的样本 (M, D)，在函数内部 detach
         bandwidth: 核带宽
     返回:
-        h_hat: (N,) — 每个查询点 x_i 的 ĥ_t(x_i) 值
+        h_hat: (N,)
     """
-    # p_t 项：(1/N) Σ_j k(x_i, x_j^{(t)})
-    K_pt     = _kernel(x, x_t.detach(), bandwidth)    # (N, N)
-    term_pt  = K_pt.mean(dim=1)                        # (N,)
-
-    # p_data 项：(1/M) Σ_j k(x_i, y_j)
-    K_pd       = _kernel(x, x0.detach(), bandwidth)   # (N, M)
-    term_pdata = K_pd.mean(dim=1)                      # (N,)
-
-    return term_pt - term_pdata                        # (N,)
+    term_pt    = _kernel(x, x_t.detach(),    bandwidth).mean(dim=1)  # (N,)
+    term_pdata = _kernel(x, x_data.detach(), bandwidth).mean(dim=1)  # (N,)
+    return term_pt - term_pdata
 
 
 def _witness_grad(
@@ -146,39 +131,25 @@ def _witness_grad(
     x0_flat: Tensor,
     bandwidth: float,
 ) -> Tensor:
-    """用 autograd 计算 ∇_{x_i} ĥ_t(x_i)（witness function 对 x_t 的梯度）
+    """用 autograd 计算 ∇_{x_i} ĥ_t(x_i)
 
-    实现步骤：
-      1. 令 x_query（x_t_flat 的独立副本）参与梯度图
-      2. 计算 ĥ_t(x_query) 并求和，得到标量
-      3. autograd.grad 一次性得到所有 ∂ĥ/∂x_i
-
-    关键细节：
-      - x_query 是 x_t_flat.detach() 的副本，与 pred_velocity 的梯度图隔离，
-        确保 target 不会对 U-Net 产生非预期的反向传播
-      - create_graph=False：target 不需要二阶梯度，节省内存
-      - x_t 和 x0 在 _witness_function 内部 detach，只有 x_query 保留梯度
+    x_query 是 x_t_flat 的独立副本，与 pred_velocity 的梯度图隔离，
+    确保 target 不会对 U-Net 产生非预期的反向传播。
 
     参数:
-        x_t_flat: (N, D)，当前 p_t 样本（来自 x_t.reshape(B*T, D)）
-        x0_flat:  (M, D)，目标 p_data 样本（来自 x0.reshape(B*T, D)）
+        x_t_flat: (N, D)，当前 p_t 样本
+        x0_flat:  (M, D)，目标 p_data 样本
         bandwidth: 核带宽
     返回:
         grad: (N, D)，∇_{x_i} ĥ_t(x_i)
     """
-    # 独立的查询点，建立新计算图（与 pred_velocity 的图隔离）
     x_query = x_t_flat.detach().requires_grad_(True)
-
-    # ĥ_t(x_query)：形状 (N,)
     h_hat = _witness_function(x_query, x_t_flat, x0_flat, bandwidth)
-
-    # ∂(Σ_i ĥ_t(x_i)) / ∂x_i = ∇_{x_i} ĥ_t(x_i)
     grad, = torch.autograd.grad(
         outputs=h_hat.sum(),
         inputs=x_query,
         create_graph=False,
     )
-
     return grad  # (N, D)
 
 
@@ -187,25 +158,18 @@ def _witness_grad(
 # ---------------------------------------------------------------------------
 
 def _estimate_bandwidth(x: Tensor) -> float:
-    """中值启发式带宽：h = sqrt(median(‖x_i - x_j‖²) / (2 log N))
-
-    论文§5.2.2 提到 "U-statistics, yielding low variance (O(1/n))"，
-    带宽采用中值启发式（核估计标准做法）。
-
-    参数:
-        x: (N, D)，建议先将 (B,T,D) 展平后传入
-    """
+    """中值启发式带宽：h = sqrt(median_sq / (2 log N))"""
     with torch.no_grad():
         N = min(x.shape[0], 512)
         idx = torch.randperm(x.shape[0], device=x.device)[:N]
         x_sub = x[idx]
-        dist_sq = torch.cdist(x_sub, x_sub, p=2) ** 2   # (N, N)
+        dist_sq = torch.cdist(x_sub, x_sub, p=2) ** 2
         mask = torch.triu(
             torch.ones(N, N, dtype=torch.bool, device=x.device), diagonal=1
         )
         median_sq = dist_sq[mask].median()
         h = (median_sq / (2.0 * math.log(N + 1)) + 1e-8) ** 0.5
-    return h.item()
+    return max(h.item(), 1e-3)   # 防止 h 过小导致梯度爆炸
 
 
 # ---------------------------------------------------------------------------
@@ -215,14 +179,11 @@ def _estimate_bandwidth(x: Tensor) -> float:
 class MMDODE:
     """MMD 自然梯度流 ODE（CTRL-Flow §5.2.2）
 
-    Lyapunov 泛函：L = MMD²(p_t, p_data)
-    速度场目标：v*(x,t) = -∇_x ĥ_t(x)，由 witness function + autograd 计算
-    训练：U-Net 学习 v_θ ≈ v*，loss = MSE(v_θ, v*)
-
-    与 modeling_ctrlflow.py 接口完全兼容，无需修改上层代码。
+    时间约定（与 modeling_ctrlflow.py 对齐）：
+      t=1 → 纯噪声，t=0 → 干净数据
+      推理时 t 从 1 减小到 0（dt < 0），sample 从噪声变为数据
     """
 
-    # 供 modeling_ctrlflow.py 的 isinstance(self.sde, MMDODE) 分支识别
     prediction_type: str = "velocity"
 
     def __init__(
@@ -231,19 +192,19 @@ class MMDODE:
         bandwidth: float = 1.0,
         clip_sample: bool = True,
         clip_sample_range: float = 1.0,
-        mmd_reg_weight: float = 0.1,
+        mmd_reg_weight: float = 0.0,
         bandwidth_auto: bool = True,
+        target_scale: float = 1.0,
     ):
         """
         参数:
-            num_train_timesteps: 训练离散步数（用于归一化 t）
-            bandwidth: 固定核带宽 h（bandwidth_auto=True 时忽略，自动估计）
-            clip_sample: 是否裁剪推理输出
+            num_train_timesteps: 训练离散步数
+            bandwidth: 固定核带宽（bandwidth_auto=True 时忽略）
+            clip_sample: 推理时是否裁剪输出
             clip_sample_range: 裁剪范围 [-r, r]
-            mmd_reg_weight: Lyapunov 正则项权重（§7.1 stability regularizer）
-                            0 → 只用 MMD 梯度监督 loss
-                            >0 → 额外加 MMD²(p_t_pred, p_data) 惩罚项
-            bandwidth_auto: True → 中值启发式自动估计带宽（推荐）
+            mmd_reg_weight: Lyapunov 正则项权重（0 → 纯梯度监督）
+            bandwidth_auto: True → 中值启发式自动估计带宽
+            target_scale: target 归一化后的参考量级（默认 1.0，与 FM 对齐）
         """
         self.num_train_timesteps = num_train_timesteps
         self.bandwidth = bandwidth
@@ -251,21 +212,23 @@ class MMDODE:
         self.clip_sample_range = clip_sample_range
         self.mmd_reg_weight = mmd_reg_weight
         self.bandwidth_auto = bandwidth_auto
+        self.target_scale = target_scale
 
         self.timesteps: Tensor | None = None
         self.num_inference_steps: int | None = None
 
-        # 供 modeling_ctrlflow.py 读取（兼容 SDE 接口）
         self.config = _ODEConfig(num_train_timesteps=num_train_timesteps)
 
     # ------------------------------------------------------------------
-    # 前向过程：线性插值路径
+    # 前向过程：t=1 为噪声，t=0 为数据
     # ------------------------------------------------------------------
 
     def add_noise(self, x0: Tensor, noise: Tensor, timesteps: Tensor) -> Tensor:
-        """前向插值：x_t = (1-t)·noise + t·x0
+        """前向插值：x_t = (1-t)·x0 + t·noise
 
-        t=0 为纯噪声，t=1 为干净数据。线性路径确保 x_t 关于 t 连续可微。
+        t=1 时 x_t = noise（纯噪声），t=0 时 x_t = x0（干净数据）。
+        与 modeling_ctrlflow.py 的 conditional_sample 起点（randn）和
+        timesteps 方向（1→0）保持一致。
 
         参数:
             x0: 干净数据 (B, T, D)
@@ -277,14 +240,18 @@ class MMDODE:
         t = timesteps.float() / self.num_train_timesteps   # → [0, 1)
         while t.dim() < x0.dim():
             t = t.unsqueeze(-1)                            # → (B, 1, 1)
-        return (1.0 - t) * noise + t * x0
+        return (1.0 - t) * x0 + t * noise
 
     # ------------------------------------------------------------------
     # 推理接口
     # ------------------------------------------------------------------
 
     def set_timesteps(self, num_inference_steps: int) -> None:
-        """设置推理时间节点（t 从 1 降到 0，逆向生成）。"""
+        """设置推理时间节点。
+
+        与 modeling_ctrlflow.py 的 conditional_sample 一致：
+        timesteps 从 1.0 降到 1/N（t 大→小，对应噪声→数据）。
+        """
         self.num_inference_steps = num_inference_steps
         self.timesteps = torch.linspace(
             1.0, 1.0 / num_inference_steps, num_inference_steps
@@ -297,19 +264,20 @@ class MMDODE:
         sample: Tensor,
         generator: torch.Generator | None = None,
     ) -> ODEResult:
-        """一步 Euler ODE 推进：x_{t+dt} = x_t + v_θ(x_t, t) · dt
+        """一步 Euler ODE 推进：x_{t+dt} = x_t + v_θ · dt
 
-        推理方向：t 从 1→0，dt < 0。
+        dt < 0（t 从 1→0），v_θ 方向指向 p_data，
+        因此 sample 每步向数据方向靠近。
 
         参数:
             model_output: v_θ(x_t, t) (B, T, D)
             t: 当前时间步（标量）
             sample: 当前状态 x_t (B, T, D)
-            generator: 忽略（纯 ODE，无随机项）
+            generator: 忽略（纯 ODE）
         返回:
-            ODEResult，包含 prev_sample = x_{t+dt}
+            ODEResult，包含 prev_sample
         """
-        dt = -1.0 / self.num_inference_steps
+        dt = -1.0 / self.num_inference_steps   # dt < 0
 
         prev_sample = sample + model_output * dt
 
@@ -333,26 +301,24 @@ class MMDODE:
     ) -> Tensor:
         """纯 MMD 自然梯度流训练 loss
 
-        ┌─────────────────────────────────────────────────────────────────┐
-        │ 主 loss：witness function + autograd 梯度监督                   │
-        │                                                                 │
-        │   target = -∇_{x_i} ĥ_t(x_i)   （witness fn 的负梯度）        │
-        │   L_main = MSE(v_θ, target)                                    │
-        │                                                                 │
-        │   直接满足 Proposition 2 的耗散条件：                           │
-        │   ∫ <v*, ∇_x δL/δρ> p_t dx = -‖∇_{W2}L‖²_{L²(p_t)} ≤ 0      │
-        └─────────────────────────────────────────────────────────────────┘
-        ┌─────────────────────────────────────────────────────────────────┐
-        │ 辅助 loss：Lyapunov 正则（§7.1，可选）                         │
-        │                                                                 │
-        │   L_lyap = MMD²(x_t + v_θ·dt, x0)                             │
-        │   mmd_reg_weight=0 时退化为纯梯度监督                          │
-        └─────────────────────────────────────────────────────────────────┘
+        主 loss：
+            target = normalize(-∇_x ĥ_t(x_t)) * target_scale
+            L_main = MSE(v_θ, target)
+
+            target 做 L2 归一化防止量级爆炸（当带宽 h 小时 ∇ĥ 量级 ∝ 1/h²）。
+
+        速度场方向验证：
+            ĥ_t(x) = E_pt[k] - E_pdata[k]
+            当 x_t 远离 x0（t≈1）时，ĥ_t > 0，∇ĥ 指向"更像 p_t"的方向，
+            -∇ĥ 指向"更像 p_data"的方向，即推进方向正确 ✓
+
+        辅助 loss（可选）：
+            L_lyap = MMD²(x_t + v_θ·dt, x0)   （§7.1 Lyapunov 正则）
 
         参数:
             pred_velocity: v_θ(x_t, t)，U-Net 输出 (B, T, D)
-            x0:   干净数据（p_data 样本）(B, T, D)
-            noise: 初始噪声（保留以兼容接口，本版本不用于构造 target）
+            x0:   干净数据 (B, T, D)
+            noise: 初始噪声（保留接口兼容性，本版本不直接用于构造 target）
             x_t:  当前插值状态 (B, T, D)
         返回:
             标量 loss
@@ -368,68 +334,54 @@ class MMDODE:
             )
             h = _estimate_bandwidth(combined)
         else:
-            h = self.bandwidth
+            h = max(self.bandwidth, 1e-3)
 
-        # ── 展平为 (N, D) 供核计算 ───────────────────────────────────
-        xt_flat = x_t.reshape(B * T, D)   # ~ p_t
-        x0_flat = x0.reshape(B * T, D)    # ~ p_data
+        # ── witness function 梯度 ─────────────────────────────────────
+        xt_flat = x_t.reshape(B * T, D)
+        x0_flat = x0.reshape(B * T, D)
 
-        # ── 主 loss：witness function + autograd ──────────────────────
-        # grad_h = ∇_{x_i} ĥ_t(x_i)，(N, D)
-        # _witness_grad 内部对 x_query（xt_flat 的独立副本）求梯度，
-        # 与 pred_velocity 的梯度图完全隔离。
-        grad_h = _witness_grad(xt_flat, x0_flat, h)
-        target = (-grad_h).reshape(B, T, D)   # v* = -∇ĥ_t，(B, T, D)
+        grad_h = _witness_grad(xt_flat, x0_flat, h)   # (N, D)，∇_x ĥ_t
+
+        # ── 量级归一化：防止 h 小时梯度爆炸 ──────────────────────────
+        # target 方向 = -∇ĥ（推向 p_data），量级归一化后乘 target_scale
+        raw_target = -grad_h   # (N, D)
+        norms = raw_target.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
+        target = (raw_target / norms * self.target_scale).reshape(B, T, D)
 
         loss_main = F.mse_loss(pred_velocity, target.detach())
 
         if self.mmd_reg_weight <= 0.0:
             return loss_main
 
-        # ── 辅助 loss：Lyapunov 正则项（§7.1）────────────────────────
+        # ── 辅助 Lyapunov 正则（§7.1）────────────────────────────────
         dt_approx = 1.0 / self.num_train_timesteps
         x_next_flat = (x_t + pred_velocity * dt_approx).reshape(B * T, D)
-
         loss_lyap = self._mmd_squared(x_next_flat, x0_flat.detach(), h)
 
         return loss_main + self.mmd_reg_weight * loss_lyap
 
     def _mmd_squared(self, x: Tensor, y: Tensor, bandwidth: float) -> Tensor:
-        """MMD²(p, q) 无偏 U-统计量估计（用于 Lyapunov 正则项）
-
-        参数:
-            x: p 的样本 (N, D)
-            y: q 的样本 (M, D)
-            bandwidth: RBF 核带宽
-        返回:
-            标量 MMD²（无偏估计，可为负）
-        """
+        """MMD²(p, q) 无偏 U-统计量估计（用于 Lyapunov 正则项）"""
         K_xx = _kernel(x, x, bandwidth)
         K_yy = _kernel(y, y, bandwidth)
         K_xy = _kernel(x, y, bandwidth)
-
         N, M = x.shape[0], y.shape[0]
-
-        K_xx_sum = K_xx.sum() - K_xx.trace()
-        K_yy_sum = K_yy.sum() - K_yy.trace()
-
-        term_xx = K_xx_sum / (N * (N - 1) + 1e-8)
-        term_yy = K_yy_sum / (M * (M - 1) + 1e-8)
+        term_xx = (K_xx.sum() - K_xx.trace()) / (N * (N - 1) + 1e-8)
+        term_yy = (K_yy.sum() - K_yy.trace()) / (M * (M - 1) + 1e-8)
         term_xy = K_xy.mean()
-
         return term_xx - 2.0 * term_xy + term_yy
 
     # ------------------------------------------------------------------
-    # 兼容 SDEBase 的占位方法（避免 AttributeError）
+    # 兼容 SDEBase 的占位方法
     # ------------------------------------------------------------------
 
     def _alpha(self, t: Tensor) -> Tensor:
-        """线性插值路径的均值系数 α(t) = t"""
-        return t
+        """均值系数 α(t) = 1-t（t=1 时为噪声）"""
+        return 1.0 - t
 
     def _sigma(self, t: Tensor) -> Tensor:
-        """线性插值路径的噪声系数 σ(t) = 1 - t"""
-        return 1.0 - t
+        """噪声系数 σ(t) = t"""
+        return t
 
 
 # ---------------------------------------------------------------------------
