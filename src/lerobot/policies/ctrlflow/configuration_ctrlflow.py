@@ -59,7 +59,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     use_film_scale_modulation: bool = True
     # SDE/ODE 类型选择.
     sde_type: str = "W2-ODE"
-    num_train_timesteps: int = 100
+    num_train_timesteps: int = 10
     beta_start: float = 0.0001
     beta_end: float = 0.02
     prediction_type: str = "epsilon"
@@ -73,7 +73,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     # W2-ODE 专属超参（仅 sde_type="W2-ODE" 时生效）
     w2_path_type: str = "linear"           # linear / cosine / sqrt / poly
     w2_path_poly_order: float = 2.0        # poly 路径阶数 p
-    w2_lyapunov_reg_weight: float = 0.0    # §7.1 Lyapunov 正则项权重（0 → 纯速度场监督）
+    w2_lyapunov_reg_weight: float = 0.1    # §7.1 Lyapunov 正则项权重（0 → 纯速度场监督）
     w2_inference_noise_scale: float = 0.0  # §5.2.1 推理扩散项强度 β（0 → 纯 ODE）
     w2_sampling_method: str = "euler"      # euler / rk4
 
