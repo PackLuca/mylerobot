@@ -58,8 +58,8 @@ class CtrlFlowConfig(PreTrainedConfig):
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
     # SDE/ODE 类型选择.
-    sde_type: str = "W2-ODE"
-    num_train_timesteps: int = 10
+    sde_type: str = "DS-SDE"
+    num_train_timesteps: int = 100
     beta_start: float = 0.0001
     beta_end: float = 0.02
     prediction_type: str = "epsilon"
