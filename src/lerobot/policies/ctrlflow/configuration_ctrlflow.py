@@ -68,8 +68,8 @@ class CtrlFlowConfig(PreTrainedConfig):
     # DS-SDE 专属超参（仅 sde_type="DS-SDE" 时生效）
     ds_gamma_min: float = 0.5
     ds_gamma_max: float = 3.0
-    ds_g_min: float = 0.0
-    ds_g_max: float = 0.0
+    ds_g_min: float = 0.01
+    ds_g_max: float = 0.3
     # W2-ODE 专属超参（仅 sde_type="W2-ODE" 时生效）
     w2_path_type: str = "linear"           # linear / cosine / sqrt / poly
     w2_path_poly_order: float = 2.0        # poly 路径阶数 p
