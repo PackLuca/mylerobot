@@ -220,8 +220,8 @@ class DSSDE(SDEBase):
     def __init__(
         self,
         num_train_timesteps: int = 100,
-        gamma_min: float = 0.0,
-        gamma_max: float = 0.0,
+        gamma_min: float = 0.5,
+        gamma_max: float = 1.0,
         g_min: float = 0.01,
         g_max: float = 1.0,
         clip_sample: bool = True,
