@@ -57,6 +57,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
+
     # SDE/ODE 类型选择.
     sde_type: str = "DS-SDE"
     num_train_timesteps: int = 100
@@ -65,17 +66,49 @@ class CtrlFlowConfig(PreTrainedConfig):
     prediction_type: str = "epsilon"
     clip_sample: bool = True
     clip_sample_range: float = 1.0
+
     # DS-SDE 专属超参（仅 sde_type="DS-SDE" 时生效）
     ds_gamma_min: float = 0.5
     ds_gamma_max: float = 3.0
     ds_g_min: float = 0.01
-    ds_g_max: float = 0.3
+    ds_g_max: float = 1.0
+
     # W2-ODE 专属超参（仅 sde_type="W2-ODE" 时生效）
     w2_path_type: str = "linear"           # linear / cosine / sqrt / poly
     w2_path_poly_order: float = 2.0        # poly 路径阶数 p
-    w2_lyapunov_reg_weight: float = 0.01    # §7.1 Lyapunov 正则项权重（0 → 纯速度场监督）
+    w2_lyapunov_reg_weight: float = 0.01   # §7.1 Lyapunov 正则项权重（0 → 纯速度场监督）
     w2_inference_noise_scale: float = 0.0  # §5.2.1 推理扩散项强度 β（0 → 纯 ODE）
     w2_sampling_method: str = "euler"      # euler / rk4
+
+    # Mixed-W2KL 专属超参（仅 sde_type="Mixed-W2KL" 时生效）
+    # ─────────────────────────────────────────────────────────────────
+    # 前向路径复用 DS-SDE（共用 ds_gamma_min/max、ds_g_min/max），
+    # 以下为混合 loss 和推理的额外控制参数。
+    #
+    # t_switch：W₂/KL 切换点（归一化时间 [0,1]）
+    #   t > t_switch → W₂ 主导（高噪声，全局搬运）
+    #   t ≤ t_switch → KL 主导（低噪声，精细对齐）
+    mix_t_switch: float = 0.5
+    #
+    # mix_switch_sharpness：sigmoid 切换陡峭度 γ
+    #   γ 大 → 接近硬切换，γ 小 → 平滑过渡
+    #   推荐范围：4.0（平滑）~ 12.0（近似硬切）
+    mix_switch_sharpness: float = 6.0
+    #
+    # mix_kl_sde_noise_scale：KL 阶段推理随机项强度（相对于 g²(t)）
+    #   0.0 → KL 阶段也用纯 ODE（无随机扩散）
+    #   1.0 → 使用完整 DS-SDE 扩散项（对应 Schrödinger Bridge 极限）
+    mix_kl_sde_noise_scale: float = 1.0
+    #
+    # mix_kl_as_velocity_weight：KL 分量中 velocity 监督的比例 λ
+    #   1.0 → KL 分量退化为纯 velocity 监督（两分量等价，用于对照实验）
+    #   0.0 → KL 分量退化为纯 epsilon 监督（最大异构，强调 score 学习）
+    #   0.5 → 默认：velocity 和 epsilon 各占一半
+    mix_kl_as_velocity_weight: float = 0.5
+    #
+    # mix_lyapunov_reg_weight：§7.1 Lyapunov 正则项权重
+    #   0.0 → 关闭正则项
+    mix_lyapunov_reg_weight: float = 0.0
 
     # Inference
     num_inference_steps: int | None = None
@@ -110,7 +143,7 @@ class CtrlFlowConfig(PreTrainedConfig):
                 f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
             )
 
-        supported_sde_types = ["VP-SDE", "DS-SDE", "W2-ODE"]
+        supported_sde_types = ["VP-SDE", "DS-SDE", "W2-ODE", "Mixed-W2KL"]
         if self.sde_type not in supported_sde_types:
             raise ValueError(
                 f"`sde_type` must be one of {supported_sde_types}. Got {self.sde_type}."
@@ -140,6 +173,30 @@ class CtrlFlowConfig(PreTrainedConfig):
             if self.w2_inference_noise_scale < 0:
                 raise ValueError(
                     f"`w2_inference_noise_scale` must be >= 0. Got {self.w2_inference_noise_scale}."
+                )
+
+        # Mixed-W2KL 专属参数校验
+        if self.sde_type == "Mixed-W2KL":
+            if not (0.0 < self.mix_t_switch < 1.0):
+                raise ValueError(
+                    f"`mix_t_switch` must be in (0, 1). Got {self.mix_t_switch}."
+                )
+            if self.mix_switch_sharpness <= 0:
+                raise ValueError(
+                    f"`mix_switch_sharpness` must be positive. Got {self.mix_switch_sharpness}."
+                )
+            if self.mix_kl_sde_noise_scale < 0:
+                raise ValueError(
+                    f"`mix_kl_sde_noise_scale` must be >= 0. Got {self.mix_kl_sde_noise_scale}."
+                )
+            if not (0.0 <= self.mix_kl_as_velocity_weight <= 1.0):
+                raise ValueError(
+                    f"`mix_kl_as_velocity_weight` must be in [0, 1]. "
+                    f"Got {self.mix_kl_as_velocity_weight}."
+                )
+            if self.mix_lyapunov_reg_weight < 0:
+                raise ValueError(
+                    f"`mix_lyapunov_reg_weight` must be >= 0. Got {self.mix_lyapunov_reg_weight}."
                 )
 
         if self.resize_shape is not None and (

@@ -23,6 +23,7 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from lerobot.policies.ctrlflow.mysde import VPSDE, DSSDE, SDEBase
 from lerobot.policies.ctrlflow.myode import W2FlowODE
+from lerobot.policies.ctrlflow.mymixed import MixedW2KLScheduler
 
 
 class CtrlFlowPolicy(PreTrainedPolicy):
@@ -110,8 +111,18 @@ class CtrlFlowPolicy(PreTrainedPolicy):
         return loss, None
 
 
-def _make_sde(sde_type: str, **kwargs) -> SDEBase | W2FlowODE:
-    """SDE/ODE 工厂函数"""
+def _make_sde(
+    sde_type: str, **kwargs
+) -> SDEBase | W2FlowODE | MixedW2KLScheduler:
+    """SDE/ODE 工厂函数。
+
+    支持四种类型：
+      "VP-SDE"      → VPSDE（原有，未改动）
+      "DS-SDE"      → DSSDE（原有，未改动；内部新增 _alpha_prime/_sigma_prime，
+                             但不影响工厂构造逻辑）
+      "W2-ODE"      → W2FlowODE（原有，未改动）
+      "Mixed-W2KL"  → MixedW2KLScheduler（新增）
+    """
     if sde_type == "VP-SDE":
         return VPSDE(
             num_train_timesteps=kwargs.get("num_train_timesteps", 100),
@@ -142,6 +153,23 @@ def _make_sde(sde_type: str, **kwargs) -> SDEBase | W2FlowODE:
             lyapunov_reg_weight=kwargs.get("w2_lyapunov_reg_weight", 0.0),
             inference_noise_scale=kwargs.get("w2_inference_noise_scale", 0.0),
             sampling_method=kwargs.get("w2_sampling_method", "euler"),
+        )
+    elif sde_type == "Mixed-W2KL":
+        # 前向路径复用 DS-SDE 参数（ds_gamma_*/ds_g_*），
+        # 混合行为由 mix_* 参数控制。
+        return MixedW2KLScheduler(
+            num_train_timesteps=kwargs.get("num_train_timesteps", 100),
+            gamma_min=kwargs.get("ds_gamma_min", 0.5),
+            gamma_max=kwargs.get("ds_gamma_max", 3.0),
+            g_min=kwargs.get("ds_g_min", 0.01),
+            g_max=kwargs.get("ds_g_max", 1.0),
+            clip_sample=kwargs.get("clip_sample", True),
+            clip_sample_range=kwargs.get("clip_sample_range", 1.0),
+            t_switch=kwargs.get("mix_t_switch", 0.5),
+            switch_sharpness=kwargs.get("mix_switch_sharpness", 6.0),
+            kl_sde_noise_scale=kwargs.get("mix_kl_sde_noise_scale", 1.0),
+            kl_as_velocity_weight=kwargs.get("mix_kl_as_velocity_weight", 0.5),
+            lyapunov_reg_weight=kwargs.get("mix_lyapunov_reg_weight", 0.0),
         )
     else:
         raise ValueError(f"不支持的SDE类型: {sde_type}")
@@ -189,6 +217,11 @@ class CtrlFlowModel(nn.Module):
             w2_lyapunov_reg_weight=config.w2_lyapunov_reg_weight,
             w2_inference_noise_scale=config.w2_inference_noise_scale,
             w2_sampling_method=config.w2_sampling_method,
+            mix_t_switch=config.mix_t_switch,
+            mix_switch_sharpness=config.mix_switch_sharpness,
+            mix_kl_sde_noise_scale=config.mix_kl_sde_noise_scale,
+            mix_kl_as_velocity_weight=config.mix_kl_as_velocity_weight,
+            mix_lyapunov_reg_weight=config.mix_lyapunov_reg_weight,
         )
 
         if config.num_inference_steps is None:
@@ -320,7 +353,7 @@ class CtrlFlowModel(nn.Module):
 
         pred = self.unet(noisy_trajectory, unet_timesteps, global_cond=global_cond)
 
-        # W2-ODE 走独立 loss 路径（速度场回归 + 可选 Lyapunov 正则）
+        # ── W2-ODE 路径（velocity 参数化，独立 loss）────────────────────
         if self.config.sde_type == "W2-ODE":
             loss = self.sde.compute_loss(
                 pred_velocity=pred,
@@ -329,15 +362,12 @@ class CtrlFlowModel(nn.Module):
                 x_t=noisy_trajectory,
                 timesteps=timesteps,
             )
-            # padding mask（与 SDE 路径对齐）
             if self.config.do_mask_loss_for_padding:
                 if "action_is_pad" not in batch:
                     raise ValueError(
                         "You need to provide 'action_is_pad' in the batch when "
                         f"{self.config.do_mask_loss_for_padding=}."
                     )
-                # W2-ODE compute_loss 返回标量，padding mask 需在 element-wise loss 上施加
-                # 此处重新计算 element-wise loss 以支持 mask
                 target = self.sde._velocity_target(
                     trajectory, eps,
                     (timesteps.float() / self.sde.num_train_timesteps)
@@ -348,7 +378,38 @@ class CtrlFlowModel(nn.Module):
                 loss = (loss_elem * in_episode_bound.unsqueeze(-1)).mean()
             return loss
 
-        # SDE 路径（VP-SDE / DS-SDE）
+        # ── Mixed-W2KL 路径（velocity 参数化，混合 loss）────────────────
+        # 结构与 W2-ODE 分支完全对称：
+        #   - UNet 预测 velocity（prediction_type="velocity"，由调度器约定）
+        #   - loss 计算委托给 MixedW2KLScheduler.compute_loss
+        #   - padding mask 按 element-wise loss 重新计算
+        if self.config.sde_type == "Mixed-W2KL":
+            loss = self.sde.compute_loss(
+                pred_velocity=pred,
+                x0=trajectory,
+                noise=eps,
+                x_t=noisy_trajectory,
+                timesteps=timesteps,
+            )
+            if self.config.do_mask_loss_for_padding:
+                if "action_is_pad" not in batch:
+                    raise ValueError(
+                        "You need to provide 'action_is_pad' in the batch when "
+                        f"{self.config.do_mask_loss_for_padding=}."
+                    )
+                # 重新计算 element-wise velocity loss 以施加 mask
+                # 使用 DSSDE 的 velocity_target（已包含有限差分导数）
+                t_cont = timesteps.float() / self.sde.num_train_timesteps
+                t_b = t_cont
+                while t_b.dim() < trajectory.dim():
+                    t_b = t_b.unsqueeze(-1)
+                target = self.sde._dssde.velocity_target(trajectory, eps, t_b)
+                loss_elem = F.mse_loss(pred, target.detach(), reduction="none")
+                in_episode_bound = ~batch["action_is_pad"]
+                loss = (loss_elem * in_episode_bound.unsqueeze(-1)).mean()
+            return loss
+
+        # ── SDE 路径（VP-SDE / DS-SDE，epsilon/sample/score 参数化）────
         if self.config.prediction_type == "epsilon":
             target = eps
         elif self.config.prediction_type == "sample":
