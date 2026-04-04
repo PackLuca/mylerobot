@@ -59,7 +59,7 @@ class CtrlFlowConfig(PreTrainedConfig):
     use_film_scale_modulation: bool = True
     # SDE/ODE 类型选择.
     sde_type: str = "W2-ODE"
-    num_train_timesteps: int = 100
+    num_train_timesteps: int = 10
     beta_start: float = 0.0001
     beta_end: float = 0.02
     prediction_type: str = "epsilon"
