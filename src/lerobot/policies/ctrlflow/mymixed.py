@@ -1,73 +1,86 @@
-"""Mixed W₂→KL 调度器（CTRL-Flow §5.3 分层混合构造）- 修复版
+"""Mixed W₂→KL 调度器 v3（双路径设计）
 
 ===========================================================================
-【修复说明】
+【版本历史】
 ===========================================================================
 
-本版本修复了以下问题：
-1. ✅ 量纲混合：velocity 和 epsilon loss 归一化到同一量纲
-2. ✅ 数值稳定性：增强 fp16 训练和端点处的稳定性
-3. ✅ 设备匹配：使用 register_buffer 缓存常量
-4. ✅ Lyapunov 符号：修正推理方向的 dt 符号
-5. ✅ 文档一致性：更新文档说明
+v1：初始实现，epsilon 逆变换在 σ'(t)≈0 时数值爆炸（loss=23855）
+v2：引入 batch-level 归一化，修复了爆炸，但归一化把 loss 压平在 0.88，
+    模型无法收敛（kl_as_velocity_weight 实际无效）
+v3（本版本）：双路径设计，两个阶段用不同前向路径，velocity target 真正异构
 
 ===========================================================================
-【理论基础】（保持不变）
+【核心设计：双路径前向】
 ===========================================================================
 
-基于 CTRL-Flow 论文 §5.3（Hierarchical Hybrid Construction），
-将训练过程分为两个阶段：
+v1/v2 的根本问题：在同一条 DS-SDE 路径上，
+    v*_W2(t) = α'_DS(t)·x₀ + σ'_DS(t)·ε
+    v*_KL(t) = α'_DS(t)·x₀ + σ'_DS(t)·ε
+两者数学上完全相同，kl_as_velocity_weight 控制的只是 epsilon 逆变换的占比，
+而不是两种几何距离的真实差异。
 
-  Phase 1（t > t_switch，高噪声端）：W₂ 距离主导
-    - Lyapunov 泛函：L_W2 = W₂²(p_t, p_data)
-    - 监督信号：velocity target  v*(t) = α'(t)·x₀ + σ'(t)·ε
-    - 直觉：分布尚未重叠，OT 梯度提供全局搬运方向
+v3 的解决方案：让两个阶段走不同的前向路径：
 
-  Phase 2（t < t_switch，低噪声端）：KL 散度主导
-    - Lyapunov 泛函：L_KL = D_KL(p_t ‖ p_data)
-    - 监督信号：epsilon target（通过 velocity 参数化间接学习）
-    - 直觉：分布已接近，score matching 做精细密度对齐
+  W₂ 阶段（t > t_switch）：线性插值路径（Benamou-Brenier 最优传输直线）
+    x_t = (1-t)·x₀ + t·ε
+    v*_W2 = ε - x₀                         ← 常数，不依赖 t
+    物理含义：最短路径搬运，对应 W₂ 测地线
 
-混合 loss（加权叠加，满足论文定理 1 的稳定条件）：
+  KL 阶段（t ≤ t_switch）：DS-SDE 非线性路径
+    x_t = α_DS(t)·x₀ + σ_DS(t)·ε
+    v*_KL = α'_DS(t)·x₀ + σ'_DS(t)·ε      ← 随 t 变化，曲率由 γ(t)/g(t) 决定
+    物理含义：score-matching 对齐，对应 KL 散度耗散
 
-    L_mix = w₁(t) · L_vel^W2
-          + w₂(t) · [λ · L_vel^KL + (1-λ) · L_eps^KL]
+两个 target 在几何上真正不同：
+  - v*_W2 = ε - x₀ 是常数向量，指向"最短搬运方向"
+  - v*_KL 随 t 连续变化，反映 DS-SDE 路径的局部切向量
+
+===========================================================================
+【add_noise 的分流设计】
+===========================================================================
+
+训练时每个样本按其 timestep 决定走哪条路：
+
+  t > t_switch → 用线性插值加噪：x_t = (1-t)·x₀ + t·ε
+  t ≤ t_switch → 用 DS-SDE 加噪：x_t = α_DS(t)·x₀ + σ_DS(t)·ε
+
+推理时不使用 add_noise，只用 step，无需分流。
+
+===========================================================================
+【loss 设计】
+===========================================================================
+
+    L = w₁(t)·‖v̂ - v*_W2‖²  +  w₂(t)·‖v̂ - v*_KL‖²
 
 其中：
-    w₁(t) = sigmoid(γ · (t - t_switch))     t 大时 → 1（W₂ 主导）
-    w₂(t) = 1 - w₁(t)                       t 小时 → 1（KL 主导）
+    w₁(t) = sigmoid(γ·(t - t_switch))     t 大时 → 1（W₂ 主导）
+    w₂(t) = 1 - w₁(t)                     t 小时 → 1（KL 主导）
 
-    L_vel   = ‖v̂ - v*(t)‖²     velocity 监督（两阶段共享目标）
-    L_eps   = ‖ε̂ - ε‖²         epsilon 监督（从 v̂ 反推 ε̂）
-    ε̂       = (v̂ - α'·x₀_est) / σ'
-    x₀_est  = (x_t - σ·ε) / α
+两项 target 不同，权重真正有意义。
 
-【关键修复】
-为防止 L_vel 和 L_eps 量纲不匹配导致梯度失衡，
-本版本使用 running mean 归一化两项到同一尺度后再混合。
+关键性质：
+  - 两项都是 MSE，量纲一致，不需要归一化
+  - 不涉及 epsilon 逆变换，无数值稳定性问题
+  - kl_as_velocity_weight 参数已废弃（两个 target 天然不同）
 
-===========================================================================
-【推理过程】（保持不变）
-===========================================================================
-
-推理时 UNet 输出 velocity v̂，步进公式为：
-
-  t > t_switch（W₂ 主导阶段）：
-    纯 ODE 积分，x_{t+dt} = x_t + v̂ · dt        （轨迹直，步数少）
-
-  t ≤ t_switch（KL 主导阶段）：
-    加入 DS-SDE 的随机扩散项，近似 Schrödinger Bridge：
-    x_{t+dt} = x_t + v̂ · dt + √(2·g²(t)·scale·|dt|) · z
+可选 Lyapunov 正则项（§7.1）：
+    L_lyap = ‖x_t + v̂·dt - x₀‖²           （dt < 0，推理方向）
 
 ===========================================================================
-【接口约定】（保持不变）
+【推理过程】（与 v2 相同）
 ===========================================================================
 
-对外暴露与 DSSDE / W2FlowODE 完全一致的接口：
+  t > t_switch → 纯 ODE：x_{t+dt} = x_t + v̂·dt
+  t ≤ t_switch → SDE：   x_{t+dt} = x_t + v̂·dt + √(2·g²·scale·|dt|)·z
+
+===========================================================================
+【接口约定】（与 v1/v2 完全兼容）
+===========================================================================
+
   - prediction_type = "velocity"
   - add_noise(x0, noise, timesteps) → x_t
   - set_timesteps(num_inference_steps)
-  - step(model_output, t, sample) → SDEResult
+  - step(model_output, t, sample)   → SDEResult
   - compute_loss(pred, x0, noise, x_t, timesteps) → scalar
   - config.num_train_timesteps
 """
@@ -92,32 +105,28 @@ class _MixedConfig:
 
 
 # ---------------------------------------------------------------------------
-# Mixed W₂→KL Scheduler（修复版）
+# Mixed W₂→KL Scheduler v3（双路径）
 # ---------------------------------------------------------------------------
 
-class MixedW2KLScheduler(nn.Module):  # 改为继承 nn.Module 以使用 register_buffer
-    """DS-SDE 路径上的 W₂→KL 分层混合调度器（修复版）。
+class MixedW2KLScheduler(nn.Module):
+    """DS-SDE / Linear 双路径 W₂→KL 混合调度器（v3）。
 
-    前向路径（add_noise）：使用 DS-SDE 的 α(t)、σ(t)，与纯 DS-SDE 完全一致。
-    训练 loss：velocity 坐标下的加权混合，见模块文档。
-    推理步进：t > t_switch 时纯 ODE，t ≤ t_switch 时带随机扩散项。
+    W₂ 阶段（t > t_switch）：线性插值路径，v* = ε - x₀（常数目标）
+    KL 阶段（t ≤ t_switch）：DS-SDE 非线性路径，v* = α'(t)x₀ + σ'(t)ε
 
     参数:
         num_train_timesteps: 训练离散步数
-        gamma_min, gamma_max: DS-SDE γ(t) 调度参数
-        g_min, g_max:         DS-SDE g(t) 调度参数
+        gamma_min, gamma_max: DS-SDE γ(t) 调度参数（KL 阶段路径）
+        g_min, g_max:         DS-SDE g(t) 调度参数（KL 阶段路径）
         clip_sample:          推理时是否裁剪输出
         clip_sample_range:    裁剪范围
         t_switch:             W₂/KL 切换点，t ∈ [0,1]，默认 0.5
-        switch_sharpness:     sigmoid 陡峭度 γ，越大切换越硬，默认 6.0
-        kl_sde_noise_scale:   KL 阶段推理随机项强度（0 → 纯 ODE），默认 1.0
-        kl_as_velocity_weight: KL 分量中 velocity 监督的占比 λ，默认 0.5
-        lyapunov_reg_weight:  §7.1 Lyapunov 正则项权重（0 → 关闭），默认 0.0
-        num_precompute_steps: DSSDE lookup table 精度，默认 1000
-        eps_loss_scale:       epsilon loss 的手动缩放因子（可选，默认 1.0）
+        switch_sharpness:     sigmoid 陡峭度，默认 6.0
+        kl_sde_noise_scale:   KL 阶段推理随机项强度，默认 1.0
+        lyapunov_reg_weight:  §7.1 Lyapunov 正则项权重，默认 0.0
+        num_precompute_steps: DS-SDE lookup table 精度，默认 1000
     """
 
-    # modeling_ctrlflow.py 通过此属性判断参数化类型
     prediction_type: str = "velocity"
 
     def __init__(
@@ -132,40 +141,32 @@ class MixedW2KLScheduler(nn.Module):  # 改为继承 nn.Module 以使用 registe
         t_switch: float = 0.5,
         switch_sharpness: float = 6.0,
         kl_sde_noise_scale: float = 1.0,
-        kl_as_velocity_weight: float = 0.5,
         lyapunov_reg_weight: float = 0.0,
         num_precompute_steps: int = 1000,
-        eps_loss_scale: float = 1.0,  # 新增：手动缩放因子
     ):
-        super().__init__()  # 调用 nn.Module 的初始化
-        
+        super().__init__()
+
         # ── 参数校验 ──────────────────────────────────────────────────
         assert 0.0 < t_switch < 1.0, \
             f"t_switch 必须在 (0,1) 内，得到 {t_switch}"
         assert switch_sharpness > 0, \
             f"switch_sharpness 必须为正数，得到 {switch_sharpness}"
-        assert 0.0 <= kl_sde_noise_scale, \
+        assert kl_sde_noise_scale >= 0.0, \
             f"kl_sde_noise_scale 必须 >= 0，得到 {kl_sde_noise_scale}"
-        assert 0.0 <= kl_as_velocity_weight <= 1.0, \
-            f"kl_as_velocity_weight 必须在 [0,1]，得到 {kl_as_velocity_weight}"
         assert lyapunov_reg_weight >= 0.0, \
             f"lyapunov_reg_weight 必须 >= 0，得到 {lyapunov_reg_weight}"
-        assert eps_loss_scale > 0.0, \
-            f"eps_loss_scale 必须为正数，得到 {eps_loss_scale}"
 
         self.num_train_timesteps = num_train_timesteps
         self.clip_sample = clip_sample
         self.clip_sample_range = clip_sample_range
         self.kl_sde_noise_scale = kl_sde_noise_scale
-        self.kl_as_velocity_weight = kl_as_velocity_weight
         self.lyapunov_reg_weight = lyapunov_reg_weight
-        self.eps_loss_scale = eps_loss_scale
 
-        # ✅ 修复 3：使用 register_buffer 缓存常量（自动处理设备）
-        self.register_buffer('_t_switch_tensor', torch.tensor(t_switch))
-        self.register_buffer('_sharpness_tensor', torch.tensor(switch_sharpness))
+        # register_buffer：自动跟随 .to(device) / .to(dtype)
+        self.register_buffer('_t_switch', torch.tensor(t_switch))
+        self.register_buffer('_sharpness', torch.tensor(switch_sharpness))
 
-        # 内部 DS-SDE：负责 α/σ/α'/σ'/g² 的所有计算
+        # DS-SDE：负责 KL 阶段的路径系数及其导数
         self._dssde = DSSDE(
             num_train_timesteps=num_train_timesteps,
             gamma_min=gamma_min,
@@ -180,32 +181,78 @@ class MixedW2KLScheduler(nn.Module):  # 改为继承 nn.Module 以使用 registe
 
         self.timesteps: Tensor | None = None
         self.num_inference_steps: int | None = None
-
-        # 供 modeling_ctrlflow.py 的 sde.config 查询
         self.config = _MixedConfig(num_train_timesteps=num_train_timesteps)
 
     # ------------------------------------------------------------------
-    # 权重调度
+    # 内部工具
     # ------------------------------------------------------------------
 
     def _w1(self, t: Tensor) -> Tensor:
-        """W₂ 权重：w₁(t) = sigmoid(γ·(t - t_switch))
+        """W₂ 权重 w₁(t) = sigmoid(γ·(t - t_switch))
 
-        t > t_switch → w₁ → 1（W₂ 主导，高噪声端）
-        t < t_switch → w₁ → 0（KL 主导，低噪声端）
+        t > t_switch → w₁ → 1（W₂/线性路径主导）
+        t < t_switch → w₁ → 0（KL/DS-SDE 路径主导）
         """
-        # ✅ 修复 3：使用缓存的 tensor（自动匹配设备和类型）
-        t_switch = self._t_switch_tensor.to(t.device, t.dtype)
-        sharpness = self._sharpness_tensor.to(t.device, t.dtype)
-        return torch.sigmoid(sharpness * (t - t_switch))
+        t_sw = self._t_switch.to(t.device, t.dtype)
+        sh   = self._sharpness.to(t.device, t.dtype)
+        return torch.sigmoid(sh * (t - t_sw))
+
+    def _linear_alpha(self, t: Tensor) -> Tensor:
+        """线性路径：α(t) = 1 - t"""
+        return 1.0 - t
+
+    def _linear_sigma(self, t: Tensor) -> Tensor:
+        """线性路径：σ(t) = t"""
+        return t
 
     # ------------------------------------------------------------------
-    # 前向路径：委托给 DSSDE（与纯 DS-SDE 训练完全一致）
+    # 前向路径（双路径 add_noise）
     # ------------------------------------------------------------------
 
     def add_noise(self, x0: Tensor, noise: Tensor, timesteps: Tensor) -> Tensor:
-        """前向插值：x_t = α_DS(t)·x₀ + σ_DS(t)·ε"""
-        return self._dssde.add_noise(x0, noise, timesteps)
+        """按 t 值分流的双路径前向加噪。
+
+        t > t_switch → 线性插值：x_t = (1-t)·x₀ + t·ε
+        t ≤ t_switch → DS-SDE：  x_t = α_DS(t)·x₀ + σ_DS(t)·ε
+
+        两条路产生的 x_t 在 t_switch 附近是连续的（两条路在该点的 α/σ 值
+        不一定相等，但各自在自己的阶段内保持一致性，UNet 通过时间步嵌入
+        感知当前 t，可以学到两段路径的拼接）。
+
+        参数:
+            x0:        干净数据 (B, T, D)
+            noise:     标准高斯噪声 (B, T, D)
+            timesteps: 整数时间步索引 (B,)，范围 [0, num_train_timesteps)
+        返回:
+            x_t: (B, T, D)
+        """
+        t_cont = timesteps.float() / self.num_train_timesteps  # (B,)
+
+        # 广播到 (B, 1, 1)
+        t_b = t_cont
+        while t_b.dim() < x0.dim():
+            t_b = t_b.unsqueeze(-1)
+
+        t_sw = self._t_switch.item()
+
+        # ── 线性路径（W₂ 阶段，t > t_switch）────────────────────────
+        alpha_lin = self._linear_alpha(t_b)   # (B,1,1)
+        sigma_lin = self._linear_sigma(t_b)   # (B,1,1)
+        x_t_lin   = alpha_lin * x0 + sigma_lin * noise
+
+        # ── DS-SDE 路径（KL 阶段，t ≤ t_switch）─────────────────────
+        alpha_ds  = self._dssde._alpha(t_b)   # (B,1,1)
+        sigma_ds  = self._dssde._sigma(t_b)   # (B,1,1)
+        x_t_ds    = alpha_ds * x0 + sigma_ds * noise
+
+        # ── 按样本分流（硬切换，训练时 t_switch 是边界）──────────────
+        # mask: True 表示该样本走线性路径（W₂ 阶段）
+        w2_mask = (t_cont > t_sw)              # (B,)
+        while w2_mask.dim() < x0.dim():
+            w2_mask = w2_mask.unsqueeze(-1)    # (B,1,1)
+
+        x_t = torch.where(w2_mask, x_t_lin, x_t_ds)
+        return x_t
 
     # ------------------------------------------------------------------
     # 推理接口
@@ -225,7 +272,13 @@ class MixedW2KLScheduler(nn.Module):  # 改为继承 nn.Module 以使用 registe
         sample: Tensor,
         generator: torch.Generator | None = None,
     ) -> SDEResult:
-        """一步推理积分，按当前 t 动态选择 ODE 或 SDE 步进。"""
+        """一步推理积分，按 t 动态选择 ODE 或 SDE 步进。
+
+        t > t_switch → 纯 ODE：  x_{t+dt} = x_t + v̂·dt
+        t ≤ t_switch → SDE：     x_{t+dt} = x_t + v̂·dt + √(2·g²·scale·|dt|)·z
+
+        model_output 是 UNet 预测的 velocity v̂，形状 (B, T, D)。
+        """
         if not isinstance(t, Tensor):
             t_val = torch.tensor(t, dtype=torch.float32, device=sample.device)
         else:
@@ -233,15 +286,13 @@ class MixedW2KLScheduler(nn.Module):  # 改为继承 nn.Module 以使用 registe
 
         dt = -1.0 / self.num_inference_steps
 
-        # Euler 步（ODE 部分，两个阶段都有）
         prev_sample = sample + model_output * dt
 
-        # t ≤ t_switch：加入 DS-SDE 随机扩散项
-        t_switch_val = self._t_switch_tensor.item()
-        if t_val.item() <= t_switch_val and self.kl_sde_noise_scale > 0.0:
-            g_sq = self._dssde._g_sq(t_val)
-            noise_var = 2.0 * g_sq * self.kl_sde_noise_scale * abs(dt)
-            noise_coeff = torch.sqrt(noise_var.clamp(min=0.0))
+        if t_val.item() <= self._t_switch.item() and self.kl_sde_noise_scale > 0.0:
+            g_sq        = self._dssde._g_sq(t_val)
+            noise_coeff = torch.sqrt(
+                (2.0 * g_sq * self.kl_sde_noise_scale * abs(dt)).clamp(min=0.0)
+            )
             z = torch.randn(
                 sample.shape,
                 device=sample.device,
@@ -258,7 +309,7 @@ class MixedW2KLScheduler(nn.Module):  # 改为继承 nn.Module 以使用 registe
         return SDEResult(prev_sample=prev_sample)
 
     # ------------------------------------------------------------------
-    # 训练 loss（修复版）
+    # 训练 loss（双路径 v3）
     # ------------------------------------------------------------------
 
     def compute_loss(
@@ -269,113 +320,66 @@ class MixedW2KLScheduler(nn.Module):  # 改为继承 nn.Module 以使用 registe
         x_t: Tensor,
         timesteps: Tensor,
     ) -> Tensor:
-        """W₂→KL 混合训练 loss（修复版）。
+        """双路径 W₂→KL 混合训练 loss。
 
         参数:
-            pred_velocity: v̂ = UNet 输出，形状 (B, T, D)
-            x0:            干净数据，形状 (B, T, D)
-            noise:         前向扩散时的高斯噪声，形状 (B, T, D)
-            x_t:           加噪后的状态，形状 (B, T, D)
-            timesteps:     整数时间步索引，形状 (B,)，范围 [0, num_train_timesteps)
-
-        返回:
-            标量 loss
+            pred_velocity: v̂ = UNet 输出 (B, T, D)
+            x0:            干净数据 (B, T, D)
+            noise:         前向噪声 (B, T, D)
+            x_t:           加噪状态 (B, T, D)（由双路径 add_noise 产生）
+            timesteps:     整数时间步索引 (B,)
 
         ──────────────────────────────────────────────────────────────
-        修复内容：
-        1. ✅ 量纲归一化：velocity 和 epsilon loss 归一化到同一尺度
-        2. ✅ 数值稳定性：使用更安全的 clamp 值和条件分支
-        3. ✅ Lyapunov 符号：修正 dt 的符号（推理方向）
+        loss 结构：
+
+            L = w₁(t)·‖v̂ - v*_W2‖²  +  w₂(t)·‖v̂ - v*_KL‖²
+
+            v*_W2 = ε - x₀                           （线性路径导数，常数）
+            v*_KL = α'_DS(t)·x₀ + σ'_DS(t)·ε        （DS-SDE 路径导数）
+
+        两个 target 真正不同：
+          - v*_W2 不依赖 t，对应全局搬运方向（Benamou-Brenier）
+          - v*_KL 随 t 变化，对应 KL 散度耗散方向（score matching）
+
+        两项都是 velocity MSE，量纲完全一致，无需归一化。
         ──────────────────────────────────────────────────────────────
         """
-        # ✅ 修复 2：更安全的数值常量
-        SAFE_MIN = 1e-3  # 对 fp16 更友好
-
-        # ── t 的连续值（归一化到 [0,1]），广播到 (B,1,1) ──────────────
+        # ── t 的连续值，广播到 (B,1,1) ────────────────────────────────
         t_cont = timesteps.float() / self.num_train_timesteps  # (B,)
         t_b = t_cont
         while t_b.dim() < x0.dim():
             t_b = t_b.unsqueeze(-1)  # (B,1,1)
 
-        # ── 从 lookup table 取路径系数及其导数 ────────────────────────
-        alpha = self._dssde._alpha(t_b)        # (B,1,1)
-        sigma = self._dssde._sigma(t_b)        # (B,1,1)
-        alpha_p = self._dssde._alpha_prime(t_b)  # (B,1,1)
-        sigma_p = self._dssde._sigma_prime(t_b)  # (B,1,1)
+        # ── W₂ target：线性路径导数 v*_W2 = ε - x₀ ──────────────────
+        # 线性路径 x_t = (1-t)x₀ + tε，对 t 求导：dx_t/dt = -x₀ + ε
+        v_target_w2 = noise - x0                               # (B,T,D)，不依赖 t
 
-        # ✅ 修复 2：安全系数（避免除零和下溢）
-        alpha_safe = alpha.abs().clamp(min=SAFE_MIN)
-        sigma_safe = sigma.abs().clamp(min=SAFE_MIN)
-        sigma_p_safe = sigma_p.abs().clamp(min=SAFE_MIN)
+        # ── KL target：DS-SDE 路径导数 v*_KL = α'(t)x₀ + σ'(t)ε ─────
+        alpha_p = self._dssde._alpha_prime(t_b)                # (B,1,1)
+        sigma_p = self._dssde._sigma_prime(t_b)                # (B,1,1)
+        v_target_kl = alpha_p * x0 + sigma_p * noise          # (B,T,D)
 
-        # ── velocity target v*(t) = α'·x₀ + σ'·ε ─────────────────────
-        v_target = alpha_p * x0 + sigma_p * noise  # (B,T,D)
-
-        # ── 逐样本权重 w₁(t)，形状 (B,1,1) ───────────────────────────
+        # ── 软权重 w₁(t) / w₂(t)，形状 (B,1,1) ──────────────────────
         w1 = self._w1(t_cont)
         while w1.dim() < x0.dim():
             w1 = w1.unsqueeze(-1)
         w2 = 1.0 - w1
 
-        # ── W₂ 分量：velocity MSE ─────────────────────────────────────
-        loss_vel = F.mse_loss(pred_velocity, v_target.detach(), reduction="none")
+        # ── element-wise loss（保留 reduction="none" 以支持 padding mask）
+        loss_w2 = F.mse_loss(pred_velocity, v_target_w2.detach(), reduction="none")
+        loss_kl = F.mse_loss(pred_velocity, v_target_kl.detach(), reduction="none")
 
-        # ── KL 分量：epsilon MSE（修复版）──────────────────────────────
-        # ✅ 修复 2：稳定的 x0_est（处理 sigma 很小的情况）
-        x0_est = torch.where(
-            sigma.abs() > SAFE_MIN,
-            (x_t - sigma * noise) / alpha_safe,
-            x_t / alpha_safe  # 退化情况：σ≈0 时，x_t ≈ α·x0
-        )
+        # ── 加权混合 ──────────────────────────────────────────────────
+        # 注意：两项 target 不同，loss 值量级可能略有差异。
+        # 由于都是 velocity MSE，量纲一致，直接加权即可，无需归一化。
+        loss = w1 * loss_w2 + w2 * loss_kl
 
-        # ✅ 修复 2：从 velocity 反推 epsilon，并裁剪异常值
-        pred_eps = (pred_velocity - alpha_p * x0_est.detach()) / sigma_p_safe
-        pred_eps = pred_eps.clamp(-10.0, 10.0)  # 防止梯度爆炸
-
-        loss_eps = F.mse_loss(pred_eps, noise.detach(), reduction="none")
-
-        # ── ✅ 修复 1：量纲归一化混合 ────────────────────────────────
-        # 使用 detach() 的 running mean 归一化（不影响梯度流）
-        vel_scale = loss_vel.detach().mean() + 1e-8
-        eps_scale = loss_eps.detach().mean() + 1e-8
-
-        # 归一化到同一尺度
-        loss_vel_norm = loss_vel / vel_scale
-        loss_eps_norm = loss_eps / eps_scale * self.eps_loss_scale
-
-        # 加权混合
-        lam = self.kl_as_velocity_weight
-        loss = (
-            w1 * loss_vel_norm  # W₂ 阶段：纯 velocity
-            + w2 * (lam * loss_vel_norm + (1.0 - lam) * loss_eps_norm)  # KL 阶段：混合
-        )
-
-        # 可选：恢复原始 scale（用于日志可读性）
-        # avg_scale = (vel_scale + eps_scale * self.eps_loss_scale) / 2.0
-        # loss = loss * avg_scale
-
-        # ── ✅ 修复 4：Lyapunov 正则项（修正 dt 符号）─────────────────
+        # ── 可选：Lyapunov 正则项（§7.1）─────────────────────────────
         if self.lyapunov_reg_weight > 0.0:
-            # 推理时 t 从 1→0，dt < 0
-            dt_infer = torch.full_like(t_cont, -1.0 / self.num_train_timesteps)
-            while dt_infer.dim() < pred_velocity.dim():
-                dt_infer = dt_infer.unsqueeze(-1)
-
-            # 正确的步进公式：x_{t-Δt} = x_t + v̂ · (-Δt)
-            x_next_infer = x_t + pred_velocity * dt_infer
-
-            # Lyapunov 递减条件：‖x_{t-Δt} - x₀‖² 应该减小
-            loss_lyap = F.mse_loss(
-                x_next_infer, x0.detach(), reduction="none"
-            )
-
-            # 可选：只在 W₂ 阶段施加（高噪声端更重要）
-            # t_switch_val = self._t_switch_tensor.item()
-            # lyap_mask = (t_cont > t_switch_val).float()
-            # while lyap_mask.dim() < loss_lyap.dim():
-            #     lyap_mask = lyap_mask.unsqueeze(-1)
-            # loss_lyap = loss_lyap * lyap_mask
-
+            # 推理方向走一步：x_{t-dt} = x_t + v̂·(-dt) = x_t - v̂/N
+            dt_val = 1.0 / self.num_train_timesteps
+            x_next = x_t - pred_velocity * dt_val
+            loss_lyap = F.mse_loss(x_next, x0.detach(), reduction="none")
             loss = loss + self.lyapunov_reg_weight * loss_lyap
 
         return loss.mean()
