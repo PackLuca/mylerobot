@@ -168,7 +168,7 @@ def _make_sde(
             t_switch=kwargs.get("mix_t_switch", 0.5),
             switch_sharpness=kwargs.get("mix_switch_sharpness", 6.0),
             kl_sde_noise_scale=kwargs.get("mix_kl_sde_noise_scale", 1.0),
-            #kl_as_velocity_weight=kwargs.get("mix_kl_as_velocity_weight", 0.5),
+            kl_as_velocity_weight=kwargs.get("mix_kl_as_velocity_weight", 0.5),
             lyapunov_reg_weight=kwargs.get("mix_lyapunov_reg_weight", 0.0),
         )
     else:
